@@ -1,0 +1,390 @@
+// src/app.ts
+import "./config/env";
+import express, { Express, RequestHandler, ErrorRequestHandler } from "express";
+import cors from "cors";
+import helmet from "helmet";
+import session from "express-session";
+import pgSession from "connect-pg-simple";
+import path from "path";
+import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
+import compression from "compression";
+
+// ===========================
+// Rutas
+// ===========================
+import authRoutes from "./routes/auth.routes";
+import buyerRoutes from "./routes/buyer.routes";
+import sellerRoutes from "./routes/seller.routes";
+import productRoutes from "./routes/product.routes";
+import publicRoutes from "./routes/public.routes";
+import mediaRoutes from "./routes/media.routes";
+import analyticsRoutes from "./routes/analytics.routes";
+import adminRoutes from "./routes/admin.routes";
+import adminAnalyticsRoutes from "./routes/admin.analytics.routes";
+import adminTicketRoutes from "./routes/admin.ticket.routes";
+import adminAiRoutes from "./routes/admin.ai.routes";
+import adminContentRoutes from "./routes/admin.content.routes"; // Phase 2: AI Content
+import adminAiCreditsRoutes from "./routes/adminAiCredits.routes";
+import intentionRoutes from "./routes/intention.routes";
+import categoriesRoutes from "./routes/categories.routes";
+import reviewRoutes from "./routes/review.routes";
+import favoritesRoutes from "./routes/favorites.routes";
+import notificationsRoutes from "./routes/notifications.routes";
+import followsRoutes from "./routes/follows.routes";
+import recommendationsRoutes from "./routes/recommendations.routes";
+import orderRoutes from "./routes/order.routes";
+import paymentRoutes from "./routes/payment.routes";
+import sellerBillingRoutes from "./routes/sellerBilling.routes";
+import adminBillingRoutes from "./routes/adminBilling.routes";
+import whatsappIntegrationRoutes from "./routes/whatsappIntegration.routes";
+import consentRoutes from "./routes/consent.routes";
+import collectionsRoutes from "./routes/collections.routes";
+import liveChatRoutes from "./routes/liveChat.routes";
+import videoStudioRoutes from "./routes/videoStudio.routes";
+import sellerAiCreditsRoutes from "./routes/sellerAiCredits.routes";
+import stripeWebhooksRoutes from "./routes/stripeWebhooks.routes";
+import recurrenteWebhooksRoutes from "./routes/recurrenteWebhooks.routes";
+
+// Initialize Sequelize associations (must run before any query uses `include`)
+import "./models";
+import { sessionPool } from "./config/db";
+
+// Middleware global
+import { errorHandler } from "./middleware/errorHandler";
+import { multerErrorHandler } from "./middleware/multerError.middleware";
+import { httpLogger } from "./middleware/httpLogger";
+import { responseTimeLogger } from "./middleware/responseTime";
+
+// ===========================
+// App base
+// ===========================
+const app: Express = express();
+
+const PgSession = pgSession(session);
+
+// ===========================
+// Seguridad HTTP
+// ===========================
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        // Allow marketplace assets served from Supabase Storage and local uploads.
+        imgSrc: [
+          "'self'",
+          "data:",
+          "http://localhost:8800",
+          "https://flowjuyu.com",
+          "https://www.flowjuyu.com",
+          "https://yjoybxvmnfwkuzrthdge.supabase.co",
+        ],
+      },
+    },
+  }),
+);
+
+// ===========================
+// Trust proxy
+// ===========================
+app.set("trust proxy", 1);
+app.use(httpLogger);
+app.use(responseTimeLogger);
+
+// ===========================
+// Compresión
+// ===========================
+app.use(compression());
+
+// ===========================
+// Cookies
+// ===========================
+app.use(cookieParser());
+
+// ===========================
+// 🌍 CORS robusto
+// ===========================
+
+const allowlist = (
+  process.env.CORS_ORIGIN_ALLOWLIST ||
+  "http://localhost:3000,https://flowjuyu.com,https://www.flowjuyu.com,https://flowjuyu-frontend.vercel.app"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+
+    if (process.env.NODE_ENV !== "production") {
+      return cb(null, true);
+    }
+
+    if (allowlist.includes(origin)) {
+      return cb(null, true);
+    }
+
+    // endsWith(".flowjuyu.com") misses the apex domain "https://flowjuyu.com"
+    // because that string ends with "flowjuyu.com" (no leading dot).
+    // Check both: subdomain pattern AND exact apex.
+    if (
+      origin.endsWith(".flowjuyu.com") ||
+      origin === "https://flowjuyu.com" ||
+      origin === "http://flowjuyu.com"
+    ) {
+      return cb(null, true);
+    }
+
+    console.warn("🚫 CORS blocked:", origin);
+    // Use an error, not cb(null, false). With cb(null, false) the cors package
+    // lets the request fall through without CORS headers — the browser then
+    // sees a response with no Access-Control-Allow-Origin, which under HTTP/2
+    // manifests as ERR_HTTP2_PROTOCOL_ERROR instead of a clear CORS error.
+    return cb(new Error(`CORS: origin '${origin}' not allowed`));
+  },
+
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
+
+// ===========================
+// Parsers
+// ===========================
+app.use(
+  "/api/payments/webhooks/:provider",
+  express.raw({ type: "*/*", limit: "1mb" }),
+);
+app.use("/api/webhooks/stripe", express.raw({ type: "*/*", limit: "1mb" }));
+app.use("/api/webhooks/recurrente", express.raw({ type: "*/*", limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+// ===========================
+// Static (dev only)
+// ===========================
+if (process.env.NODE_ENV !== "production") {
+  app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+}
+
+// ===========================
+// PostgreSQL Pool (Sessions)
+// ===========================
+app.use(
+  session({
+    store: new PgSession({
+      pool: sessionPool,
+      tableName: "sessions",
+      createTableIfMissing: true,
+    }),
+    secret: process.env.SESSION_SECRET!,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      maxAge: 1000 * 60 * 60 * 24,
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      // Keep in sync with the refresh-token cookie (cookies.ts).
+      // In production default to "none" so cross-domain requests include it.
+      // Overridable via COOKIE_SAME_SITE env var.
+      sameSite: (() => {
+        const v = process.env.COOKIE_SAME_SITE;
+        if (v === "none" || v === "strict" || v === "lax") return v;
+        return process.env.NODE_ENV === "production" ? "none" : "lax";
+      })(),
+    },
+  }),
+);
+
+// ===========================
+// Rate limiting global
+// ===========================
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 400,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use("/api", apiLimiter);
+
+// Login with credentials — count every attempt (success + failure) to prevent
+// brute-force enumeration. 20 attempts per 15 min is generous for a human.
+app.use(
+  "/api/login",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      code: "RATE_LIMITED",
+      message: "Demasiados intentos de inicio de sesión. Espera 15 minutos.",
+    },
+  }),
+);
+
+// Legacy Google login endpoint — same policy as /api/login.
+app.use(
+  "/api/login/google",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      code: "RATE_LIMITED",
+      message: "Demasiados intentos con Google. Espera 15 minutos.",
+    },
+  }),
+);
+
+// Social / OAuth auth — redirect flows can legitimately retry on network hiccups,
+// so the window is slightly wider (30 vs 20). Still counts every attempt.
+app.use(
+  "/api/auth/social",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      code: "RATE_LIMITED",
+      message: "Demasiados intentos con Google. Espera 15 minutos.",
+    },
+  }),
+);
+
+// Token refresh — skipSuccessfulRequests: true means only FAILED refreshes
+// (invalid/expired cookie) count toward the limit. Successful refreshes from
+// active sessions never burn through this quota.
+app.use(
+  "/api/refresh",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    skipSuccessfulRequests: true,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      code: "RATE_LIMITED",
+      message: "Demasiadas solicitudes de renovación. Espera 15 minutos.",
+    },
+  }),
+);
+
+app.use(
+  "/api/forgot-password",
+  rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      ok: false,
+      code: "RATE_LIMITED",
+      message: "Demasiados intentos. Espera un momento.",
+    },
+  }),
+);
+
+// ===========================
+// Healthcheck
+// ===========================
+const healthz: RequestHandler = (_req, res): void => {
+  res.status(200).json({
+    status: "ok",
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+  });
+};
+
+app.get("/healthz", healthz);
+
+// ===========================
+// Media proxy
+// ===========================
+app.use("/media", mediaRoutes);
+
+// ======================================================
+// 🔥 RUTAS
+// ======================================================
+
+// ===========================
+// Públicas
+// ===========================
+app.use("/api", publicRoutes);
+app.use("/api", authRoutes);
+// recommendationsRoutes MUST come before productRoutes:
+// productRoutes registers GET /products/:id which would match /products/recommended
+// as id="recommended" before Express reaches this handler if mounted after.
+app.use("/api/products", recommendationsRoutes);
+app.use("/api", productRoutes);
+app.use("/api", intentionRoutes);
+app.use("/api/categories", categoriesRoutes);
+
+// ===========================
+// 🏛️ ADMIN
+// ===========================
+app.use("/api/admin", adminRoutes);
+app.use("/api/admin/analytics", adminAnalyticsRoutes);
+app.use("/api/admin", adminTicketRoutes);
+app.use("/api/admin/ai", adminAiRoutes);
+app.use("/api/admin/ai/content", adminContentRoutes); // Phase 2: AI Content Intelligence
+app.use("/api/admin/ai-credits", adminAiCreditsRoutes);
+app.use("/api/admin/billing", adminBillingRoutes); // Phase 3: Seller Billing admin review
+
+// ===========================
+// Dominio
+// ===========================
+app.use("/api/consent", consentRoutes);
+app.use("/api/buyer", buyerRoutes);
+app.use("/api/seller", sellerRoutes);
+app.use("/api/seller/billing", sellerBillingRoutes); // Phase 3: Seller Billing self-service
+app.use("/api/reviews", reviewRoutes);
+app.use("/api/favorites", favoritesRoutes);
+app.use("/api/notifications", notificationsRoutes);
+app.use("/api/follows", followsRoutes);
+app.use("/api/collections", collectionsRoutes);
+app.use("/api", liveChatRoutes);
+app.use("/api/seller", videoStudioRoutes);
+app.use("/api/seller/ai-credits", sellerAiCreditsRoutes);
+
+// Phase 5: Payment Security
+// IMPORTANT: /api/payments must be mounted BEFORE express.json() would affect
+// the raw webhook body. The route file applies express.raw() on /webhooks/:provider.
+app.use("/api/orders", orderRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/webhooks/stripe", stripeWebhooksRoutes);
+app.use("/api/webhooks/recurrente", recurrenteWebhooksRoutes);
+app.use("/api/integrations/whatsapp", whatsappIntegrationRoutes);
+
+// ===========================
+// Analytics
+// ===========================
+app.use("/api/analytics", analyticsRoutes);
+
+// ===========================
+// 404
+// ===========================
+app.use((_req, res) => {
+  res.status(404).json({ message: "Not found" });
+});
+
+// ===========================
+// Error handling
+// ===========================
+app.use(multerErrorHandler as ErrorRequestHandler);
+app.use(errorHandler);
+
+export default app;

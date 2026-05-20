@@ -1,0 +1,516 @@
+import { Router, Request, Response } from "express";
+import asyncHandler from "../middleware/asyncHandler";
+import { verifyToken, requireRole } from "../middleware/auth";
+import { exec } from "child_process";
+import fs from "fs";
+import path from "path";
+
+// Controllers
+import * as AdminController from "../controllers/admin.controller";
+import { searchAdminProducts } from "../controllers/admin.controller";
+import * as AdminTicketController from "../controllers/admin.ticket.controller";
+import {
+  markInProgress,
+  markWaitingUser,
+  generateReplySuggestion,
+} from "../controllers/admin.ticket.controller";
+import * as AdminTicketStatsController from "../controllers/admin.ticket.stats.controller";
+
+import {
+  getAllSellers,
+  getSellerDetail,
+  approveSeller,
+  rejectSeller,
+  suspendSeller,
+  reactivateSeller,
+  eliminateSeller,
+  reviewSellerKYC,
+  requestKycDocuments,
+  flagSellerManually,
+  getSellerTickets,
+  getSellerKycUrls,
+  rerunSellerKycAutomation,
+} from "../controllers/admin.seller.governance.controller";
+
+import { getSellerLeads } from "../controllers/admin.leads.controller";
+import { getAuditEvents } from "../controllers/admin.audit.controller";
+import {
+  getSecurityAlerts,
+  getUserRisk,
+  getIpRisk,
+  acknowledgeAlert,
+  resolveAlert,
+  triggerAlertGeneration,
+} from "../controllers/admin.security.controller";
+import {
+  getSecurityRestrictions,
+  revokeSecurityRestriction,
+  getDefenseSummary,
+} from "../controllers/admin.securityRestrictions.controller";
+import {
+  getSecurityProfiles,
+  getSecurityProfile,
+  getManualReviewCases,
+  approveManualReviewCase,
+  rejectManualReviewCase,
+  triggerFraudGeneration,
+  getFraudSummary,
+} from "../controllers/admin.fraud.controller";
+import {
+  getAdminReviews,
+  hideAdminReview,
+  restoreAdminReview,
+} from "../controllers/review.controller";
+
+const router: ReturnType<typeof Router> = Router();
+
+/* ===============================
+   🔐 MIDDLEWARE ADMIN GLOBAL
+=============================== */
+
+router.use(
+  verifyToken(["admin"]),
+  requireRole("admin")
+);
+
+/* ===============================
+   🤖 AI STATUS
+=============================== */
+
+router.get("/ai/status", (req: Request, res: Response) => {
+  res.json({
+    ai: "running",
+    scheduler: "active",
+    agents: [
+      "analytics",
+      "supervisor",
+      "dev",
+      "growth",
+      "memory",
+      "code-analysis",
+      "claude-bridge",
+    ],
+    timestamp: new Date(),
+  });
+});
+
+/* ===============================
+   🤖 RUN AI AGENT
+=============================== */
+
+router.post(
+  "/ai/run",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { agent } = req.body;
+
+    if (!agent) {
+      return res.status(400).json({
+        message: "Agent name required",
+      });
+    }
+
+    const allowedAgents: Record<string, string> = {
+      analytics: "run-analytics-agent.js",
+      supervisor: "run-supervisor.js",
+      dev: "run-dev-agent.js",
+      growth: "run-growth-agent.js",
+      memory: "run-memory-agent.js",
+      code: "run-code-analysis-agent.js",
+      claude: "run-claude-bridge.js",
+      cycle: "run-daily-cycle.js",
+    };
+
+    const file = allowedAgents[agent];
+
+    if (!file) {
+      return res.status(400).json({
+        message: "Unknown agent",
+      });
+    }
+
+    const command = `node flow-ai/runners/${file}`;
+
+    exec(command, (err, stdout, stderr) => {
+      if (err) {
+        return res.status(500).json({
+          message: "Agent execution failed",
+          error: stderr,
+        });
+      }
+
+      res.json({
+        message: "Agent executed successfully",
+        agent,
+        output: stdout,
+      });
+    });
+  })
+);
+
+/* ===============================
+   🤖 AI REPORTS
+=============================== */
+
+router.get(
+  "/ai/reports",
+  asyncHandler(async (req: Request, res: Response) => {
+    const reportsDir = path.join(process.cwd(), "flow-ai/reports/daily");
+
+    if (!fs.existsSync(reportsDir)) {
+      return res.json({
+        reports: [],
+      });
+    }
+
+    const files = fs.readdirSync(reportsDir);
+
+    res.json({
+      reports: files,
+    });
+  })
+);
+
+/* ===============================
+   🤖 AI TASKS
+=============================== */
+
+router.get(
+  "/ai/tasks",
+  asyncHandler(async (req: Request, res: Response) => {
+    const inbox = path.join(process.cwd(), "flow-ai/tasks/inbox");
+
+    if (!fs.existsSync(inbox)) {
+      return res.json({
+        tasks: [],
+      });
+    }
+
+    const files = fs.readdirSync(inbox);
+
+    res.json({
+      tasks: files,
+    });
+  })
+);
+
+/* ===============================
+   📊 DASHBOARD
+=============================== */
+
+router.get(
+  "/dashboard",
+  asyncHandler(AdminController.getAdminDashboard)
+);
+
+/* ===============================
+   ⭐ LEADS (CRM VENDEDORES)
+=============================== */
+
+router.get(
+  "/leads",
+  asyncHandler(getSellerLeads)
+);
+
+/* ===============================
+   🎫 TICKETS (ADMIN)
+=============================== */
+
+// stats primero
+router.get(
+  "/tickets/stats",
+  asyncHandler(AdminTicketStatsController.getTicketStats)
+);
+
+// listar todos
+router.get(
+  "/tickets",
+  asyncHandler(AdminTicketController.getAllTickets)
+);
+
+// detalle
+router.get(
+  "/tickets/:id",
+  asyncHandler(AdminTicketController.getTicketDetailAdmin)
+);
+
+// asignar
+router.patch(
+  "/tickets/:id/assign",
+  asyncHandler(AdminTicketController.assignTicket)
+);
+
+// cambiar estado
+router.patch(
+  "/tickets/:id/status",
+  asyncHandler(AdminTicketController.changeTicketStatus)
+);
+
+// responder
+router.post(
+  "/tickets/:id/reply",
+  asyncHandler(AdminTicketController.replyToTicketAdmin)
+);
+
+// cerrar
+router.patch(
+  "/tickets/:id/close",
+  asyncHandler(AdminTicketController.closeTicket)
+);
+
+// marcar en proceso
+router.patch(
+  "/tickets/:id/in-progress",
+  asyncHandler(markInProgress)
+);
+
+// marcar esperando usuario
+router.patch(
+  "/tickets/:id/waiting",
+  asyncHandler(markWaitingUser)
+);
+
+// sugerencia de respuesta IA
+router.post(
+  "/tickets/:id/suggest-reply",
+  asyncHandler(generateReplySuggestion)
+);
+
+/* ===============================
+   🏪 SELLER GOVERNANCE
+=============================== */
+
+// listar todos
+router.get(
+  "/sellers",
+  asyncHandler(getAllSellers)
+);
+
+// detalle
+router.get(
+  "/sellers/:id",
+  asyncHandler(getSellerDetail)
+);
+
+// aprobar
+router.patch(
+  "/sellers/:id/approve",
+  asyncHandler(approveSeller)
+);
+
+// rechazar
+router.patch(
+  "/sellers/:id/reject",
+  asyncHandler(rejectSeller)
+);
+
+// suspender
+router.patch(
+  "/sellers/:id/suspend",
+  asyncHandler(suspendSeller)
+);
+
+// reactivar
+router.patch(
+  "/sellers/:id/reactivate",
+  asyncHandler(reactivateSeller)
+);
+
+// eliminar (logical deletion — irreversible)
+router.patch(
+  "/sellers/:id/eliminate",
+  asyncHandler(eliminateSeller)
+);
+
+// 🔥 KYC REVIEW
+router.patch(
+  "/sellers/:id/kyc-review",
+  asyncHandler(reviewSellerKYC)
+);
+
+router.post(
+  "/sellers/:id/kyc-rerun",
+  asyncHandler(rerunSellerKycAutomation)
+);
+
+// 📄 REQUEST MORE DOCUMENTS
+router.patch(
+  "/sellers/:id/request-documents",
+  asyncHandler(requestKycDocuments)
+);
+
+// 🚩 FLAG SELLER MANUALLY
+router.patch(
+  "/sellers/:id/flag",
+  asyncHandler(flagSellerManually)
+);
+
+// 🎫 SELLER TICKETS
+router.get(
+  "/sellers/:id/tickets",
+  asyncHandler(getSellerTickets)
+);
+
+// 🔑 KYC SIGNED URLS — time-limited, admin-only
+router.get(
+  "/sellers/:id/kyc-urls",
+  asyncHandler(getSellerKycUrls)
+);
+
+/* ===============================
+   📦 PRODUCTS (ADMIN)
+=============================== */
+
+router.get(
+  "/products",
+  asyncHandler(AdminController.getAllAdminProducts)
+);
+
+// ⚠️ /products/search MUST be before /products/:id
+router.get(
+  "/products/search",
+  asyncHandler(searchAdminProducts)
+);
+
+router.get(
+  "/products/:id",
+  asyncHandler(AdminController.getAdminProductDetail)
+);
+
+router.patch(
+  "/products/:id/toggle",
+  asyncHandler(AdminController.toggleAdminProduct)
+);
+
+/* ===============================
+   📝 REVIEWS MODERATION
+=============================== */
+
+router.get(
+  "/reviews",
+  asyncHandler(getAdminReviews)
+);
+
+router.patch(
+  "/reviews/:id/hide",
+  asyncHandler(hideAdminReview)
+);
+
+router.patch(
+  "/reviews/:id/restore",
+  asyncHandler(restoreAdminReview)
+);
+
+/* ===============================
+   🔎 AUDIT EVENTS
+=============================== */
+
+router.get(
+  "/audit-events",
+  asyncHandler(getAuditEvents)
+);
+
+/* ===============================
+   🛡️ SECURITY INTELLIGENCE
+=============================== */
+
+// Alert list (filtered)
+router.get(
+  "/security/alerts",
+  asyncHandler(getSecurityAlerts)
+);
+
+// Trigger full security scan
+router.post(
+  "/security/alerts/generate",
+  asyncHandler(triggerAlertGeneration)
+);
+
+// Acknowledge alert
+router.post(
+  "/security/alerts/:id/acknowledge",
+  asyncHandler(acknowledgeAlert)
+);
+
+// Resolve alert
+router.post(
+  "/security/alerts/:id/resolve",
+  asyncHandler(resolveAlert)
+);
+
+// User risk score
+router.get(
+  "/security/risk/users/:id",
+  asyncHandler(getUserRisk)
+);
+
+// IP risk score
+router.get(
+  "/security/risk/ip/:ip",
+  asyncHandler(getIpRisk)
+);
+
+// Active defense restrictions
+router.get(
+  "/security/restrictions",
+  asyncHandler(getSecurityRestrictions)
+);
+
+router.post(
+  "/security/restrictions/:id/revoke",
+  asyncHandler(revokeSecurityRestriction)
+);
+
+// Defense summary
+router.get(
+  "/security/defense/summary",
+  asyncHandler(getDefenseSummary)
+);
+
+/* ===============================
+   🔬 FRAUD INTELLIGENCE (Phase 6)
+=============================== */
+
+// Security profiles
+router.get(
+  "/security/profiles",
+  asyncHandler(getSecurityProfiles)
+);
+
+router.get(
+  "/security/profiles/:subjectType/:subjectKey",
+  asyncHandler(getSecurityProfile)
+);
+
+// Trigger fraud scan
+router.post(
+  "/security/fraud/generate",
+  asyncHandler(triggerFraudGeneration)
+);
+
+// Fraud summary
+router.get(
+  "/security/fraud/summary",
+  asyncHandler(getFraudSummary)
+);
+
+/* ===============================
+   📋 MANUAL REVIEW CASES
+=============================== */
+
+router.get(
+  "/manual-review/cases",
+  asyncHandler(getManualReviewCases)
+);
+
+// ⚠️ static routes must come before /:id to avoid Express matching "approve"/"reject" as an id
+router.post(
+  "/manual-review/cases/:id/approve",
+  asyncHandler(approveManualReviewCase)
+);
+
+router.post(
+  "/manual-review/cases/:id/reject",
+  asyncHandler(rejectManualReviewCase)
+);
+
+export default router;

@@ -1,0 +1,599 @@
+import { DataTypes, Model, Optional } from "sequelize";
+import { sequelize } from "../config/db";
+import { User } from "./user.model";
+
+/* ======================================================
+   📞 PHONE NUMBER
+====================================================== */
+export type PhoneNumber = {
+  country_code: string; // e.g. "502"
+  number: string;       // local digits only, e.g. "55554446"
+};
+
+/* ======================================================
+   🎯 Estados Oficiales
+====================================================== */
+export type EstadoValidacion =
+  | "pendiente"
+  | "en_revision"
+  | "aprobado"
+  | "rechazado";
+
+export type EstadoAdmin =
+  | "activo"
+  | "inactivo"
+  | "suspendido"
+  | "eliminado";
+
+export type KycRiesgo =
+  | "bajo"
+  | "medio"
+  | "alto";
+
+/* ======================================================
+   💰 PLAN COMERCIAL
+====================================================== */
+export type PlanTipo =
+  | "free"
+  | "founder";
+
+/* ======================================================
+   🎯 ONBOARDING STATE
+====================================================== */
+export type OnboardingState =
+  | "NEW_USER"
+  | "SELLER_REGISTERED"
+  | "PROFILE_STARTED"
+  | "FIRST_PRODUCT_STARTED"
+  | "FIRST_PRODUCT_PUBLISHED"
+  | "ACTIVATED";
+
+/* ======================================================
+   🧱 Interface Base
+====================================================== */
+interface VendedorPerfilAttrs {
+  id: number;
+  user_id: number;
+  nombre: string;
+  email: string;
+  telefono?: string | null;
+  direccion?: string | null;
+  logo?: string | null;
+  nombre_comercio: string;
+  telefono_comercio?: PhoneNumber | null;
+  departamento?: string | null;
+  municipio?: string | null;
+  descripcion?: string | null;
+  dpi?: string | null;
+  foto_dpi_frente?: string | null;
+  foto_dpi_reverso?: string | null;
+  selfie_con_dpi?: string | null;
+
+  estado_validacion: EstadoValidacion;
+  estado_admin: EstadoAdmin;
+
+  observaciones?: string | null;
+  actualizado_en?: Date | null;
+
+  banner_url?: string | null;
+  identidad_tags?: string[] | null;
+  productos_destacados?: string[] | null;
+  mensaje_destacado?: string | null;
+
+  /* ===============================
+     🏛️ KYC PROFESIONAL
+  =============================== */
+
+  kyc_checklist?: any;
+  kyc_score: number;
+  kyc_riesgo: KycRiesgo;
+  kyc_provider?: string | null;
+  kyc_provider_status?: string | null;
+  kyc_decision_reason?: string | null;
+  kyc_evidence?: any;
+  kyc_verified_at?: Date | null;
+  kyc_revisado_por?: number | null;
+  kyc_revisado_en?: Date | null;
+  notas_internas?: string | null;
+
+  /* ===============================
+     💰 PLAN COMERCIAL
+  =============================== */
+
+  plan: PlanTipo;
+  plan_activo: boolean;
+  plan_expires_at?: Date | null;
+  whatsapp_numero?: PhoneNumber | null;
+
+  /* 📱 REDES SOCIALES */
+  instagram?: string | null;
+  facebook?: string | null;
+  tiktok?: string | null;
+
+  /* 🎨 ESTILO DEL ENCABEZADO */
+  header_style?: {
+    mode: "gradient" | "image" | "image+overlay";
+    overlay_color?: string;
+    overlay_opacity?: number;
+    gradient_variant?: string;
+  } | null;
+
+  /* 🚀 ONBOARDING */
+  onboarding_state?: OnboardingState | null;
+  onboarding_completed_at?: Date | null;
+  first_product_id?: string | null;
+  activation_at?: Date | null;
+
+  /* 🔴 LIVE */
+  is_live?: boolean;
+  live_started_at?: Date | null;
+  live_message?: string | null;
+  live_featured_product_ids?: string[] | null;
+  live_current_product_id?: string | null;
+  live_external_url?: string | null;
+  live_platform?: "tiktok" | "instagram" | "facebook" | null;
+  live_collection_id?: number | null;
+
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+/* ======================================================
+   🧱 Creation Type
+====================================================== */
+type Creation = Optional<
+  VendedorPerfilAttrs,
+  | "id"
+  | "telefono"
+  | "direccion"
+  | "logo"
+  | "telefono_comercio"
+  | "departamento"
+  | "municipio"
+  | "descripcion"
+  | "dpi"
+  | "foto_dpi_frente"
+  | "foto_dpi_reverso"
+  | "selfie_con_dpi"
+  | "observaciones"
+  | "actualizado_en"
+  | "kyc_checklist"
+  | "kyc_score"
+  | "kyc_riesgo"
+  | "kyc_provider"
+  | "kyc_provider_status"
+  | "kyc_decision_reason"
+  | "kyc_evidence"
+  | "kyc_verified_at"
+  | "kyc_revisado_por"
+  | "kyc_revisado_en"
+  | "notas_internas"
+  | "plan"
+  | "plan_activo"
+  | "plan_expires_at"
+  | "whatsapp_numero"
+  | "createdAt"
+  | "updatedAt"
+  | "banner_url"
+  | "identidad_tags"
+  | "productos_destacados"
+  | "instagram"
+  | "facebook"
+  | "tiktok"
+  | "header_style"
+  | "onboarding_state"
+  | "onboarding_completed_at"
+  | "first_product_id"
+  | "activation_at"
+  | "is_live"
+  | "live_started_at"
+  | "live_message"
+  | "live_featured_product_ids"
+  | "live_current_product_id"
+  | "live_external_url"
+  | "live_platform"
+  | "live_collection_id"
+>;
+
+/* ======================================================
+   🧱 Modelo Sequelize
+====================================================== */
+export class VendedorPerfil
+  extends Model<VendedorPerfilAttrs, Creation>
+  implements VendedorPerfilAttrs
+{
+  public id!: number;
+  public user_id!: number;
+  public nombre!: string;
+  public email!: string;
+  public telefono?: string | null;
+  public direccion?: string | null;
+  public logo?: string | null;
+  public nombre_comercio!: string;
+  public telefono_comercio?: PhoneNumber | null;
+  public departamento?: string | null;
+  public municipio?: string | null;
+  public descripcion?: string | null;
+  public dpi?: string | null;
+  public foto_dpi_frente?: string | null;
+  public foto_dpi_reverso?: string | null;
+  public selfie_con_dpi?: string | null;
+
+  public estado_validacion!: EstadoValidacion;
+  public estado_admin!: EstadoAdmin;
+
+  public observaciones?: string | null;
+  public actualizado_en?: Date | null;
+
+  /* 🎨 PERSONALIZACIÓN TIENDA */
+  public banner_url?: string | null;
+  public identidad_tags?: string[] | null;
+  public productos_destacados?: string[] | null;
+  public mensaje_destacado?: string | null;
+
+  /* 🏛️ KYC */
+  public kyc_checklist?: any;
+  public kyc_score!: number;
+  public kyc_riesgo!: KycRiesgo;
+  public kyc_provider?: string | null;
+  public kyc_provider_status?: string | null;
+  public kyc_decision_reason?: string | null;
+  public kyc_evidence?: any;
+  public kyc_verified_at?: Date | null;
+  public kyc_revisado_por?: number | null;
+  public kyc_revisado_en?: Date | null;
+  public notas_internas?: string | null;
+
+  /* 💰 PLAN */
+  public plan!: PlanTipo;
+  public plan_activo!: boolean;
+  public plan_expires_at?: Date | null;
+  public whatsapp_numero?: PhoneNumber | null;
+
+  /* 📱 REDES SOCIALES */
+  public instagram?: string | null;
+  public facebook?: string | null;
+  public tiktok?: string | null;
+
+  /* 🎨 ESTILO DEL ENCABEZADO */
+  public header_style?: VendedorPerfilAttrs["header_style"];
+
+  /* 🚀 ONBOARDING */
+  public onboarding_state?: OnboardingState | null;
+  public onboarding_completed_at?: Date | null;
+  public first_product_id?: string | null;
+  public activation_at?: Date | null;
+
+  /* 🔴 LIVE */
+  public is_live?: boolean;
+  public live_started_at?: Date | null;
+  public live_message?: string | null;
+  public live_featured_product_ids?: string[] | null;
+  public live_current_product_id?: string | null;
+  public live_external_url?: string | null;
+  public live_platform?: "tiktok" | "instagram" | "facebook" | null;
+  public live_collection_id?: number | null;
+
+  public readonly createdAt?: Date;
+  public readonly updatedAt?: Date;
+}
+
+VendedorPerfil.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+      allowNull: false,
+    },
+
+    user_id: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: { model: "users", key: "id" },
+      onUpdate: "CASCADE",
+      onDelete: "CASCADE",
+    },
+
+    nombre: { type: DataTypes.STRING(100), allowNull: false },
+
+    email: {
+      type: DataTypes.STRING(100),
+      allowNull: false,
+      set(value: string) {
+        this.setDataValue("email", value?.toLowerCase().trim());
+      },
+    },
+
+    telefono: { type: DataTypes.STRING(15), allowNull: true },
+    direccion: { type: DataTypes.TEXT, allowNull: true },
+    logo: { type: DataTypes.TEXT, allowNull: true },
+
+    nombre_comercio: {
+      type: DataTypes.STRING(100),
+      allowNull: false,
+    },
+
+    telefono_comercio: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+    },
+
+    departamento: { type: DataTypes.STRING(50), allowNull: true },
+    municipio: { type: DataTypes.STRING(100), allowNull: true },
+    descripcion: { type: DataTypes.TEXT, allowNull: true },
+
+    dpi: { type: DataTypes.STRING(13), allowNull: true },
+    foto_dpi_frente: { type: DataTypes.TEXT, allowNull: true },
+    foto_dpi_reverso: { type: DataTypes.TEXT, allowNull: true },
+    selfie_con_dpi: { type: DataTypes.TEXT, allowNull: true },
+
+    estado_validacion: {
+      type: DataTypes.STRING(30),
+      allowNull: false,
+      defaultValue: "pendiente",
+    },
+
+    estado_admin: {
+      type: DataTypes.STRING(30),
+      allowNull: false,
+      defaultValue: "inactivo",
+    },
+
+    observaciones: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    actualizado_en: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    /* ===============================
+       🏛️ KYC STRUCTURE
+    =============================== */
+
+    kyc_checklist: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: {},
+    },
+
+    kyc_score: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+
+    kyc_riesgo: {
+      type: DataTypes.STRING(20),
+      allowNull: false,
+      defaultValue: "medio",
+      validate: {
+        isIn: [["bajo", "medio", "alto"]],
+      },
+    },
+
+    kyc_provider: {
+      type: DataTypes.STRING(80),
+      allowNull: true,
+    },
+
+    kyc_provider_status: {
+      type: DataTypes.STRING(40),
+      allowNull: true,
+    },
+
+    kyc_decision_reason: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    kyc_evidence: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: {},
+    },
+
+    kyc_verified_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    kyc_revisado_por: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+
+    kyc_revisado_en: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    notas_internas: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    /* ===============================
+       💰 PLAN COMERCIAL
+    =============================== */
+
+    plan: {
+      type: DataTypes.STRING(20),
+      allowNull: false,
+      defaultValue: "free",
+      validate: {
+        isIn: [["free", "founder"]],
+      },
+    },
+
+    plan_activo: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+
+    plan_expires_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    whatsapp_numero: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+    },
+
+    /* ===============================
+      🎨 PERSONALIZACIÓN TIENDA
+    ================================ */
+
+    banner_url: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    identidad_tags: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: [],
+    },
+
+    productos_destacados: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: [],
+    },
+
+    mensaje_destacado: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    /* ===============================
+       📱 REDES SOCIALES
+    ================================ */
+
+    instagram: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    facebook: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    tiktok: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    /* ===============================
+       🎨 ESTILO DEL ENCABEZADO
+    ================================ */
+
+    header_style: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+    },
+
+    /* ===============================
+       🚀 ONBOARDING
+    ================================ */
+
+    onboarding_state: {
+      type: DataTypes.STRING(30),
+      allowNull: false,
+      defaultValue: "NEW_USER",
+    },
+
+    onboarding_completed_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    first_product_id: {
+      type: DataTypes.UUID,
+      allowNull: true,
+    },
+
+    activation_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    /* 🔴 LIVE */
+    is_live: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+
+    live_started_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    live_message: {
+      type: DataTypes.STRING(160),
+      allowNull: true,
+    },
+
+    live_featured_product_ids: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      defaultValue: [],
+    },
+
+    live_current_product_id: {
+      type: DataTypes.UUID,
+      allowNull: true,
+    },
+
+    live_external_url: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
+    live_platform: {
+      type: DataTypes.STRING(20),
+      allowNull: true,
+      validate: {
+        isIn: [["tiktok", "instagram", "facebook"]],
+      },
+    },
+
+    live_collection_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+
+    createdAt: { type: DataTypes.DATE, allowNull: true },
+    updatedAt: { type: DataTypes.DATE, allowNull: true },
+  },
+  {
+    sequelize,
+    tableName: "vendedor_perfil",
+    freezeTableName: true,
+    timestamps: true,
+  }
+);
+
+/* ======================================================
+   🔗 Asociaciones
+====================================================== */
+User.hasOne(VendedorPerfil, {
+  foreignKey: "user_id",
+  as: "perfil",
+  onDelete: "CASCADE",
+  onUpdate: "CASCADE",
+});
+
+VendedorPerfil.belongsTo(User, {
+  foreignKey: "user_id",
+  as: "user",
+  onDelete: "CASCADE",
+  onUpdate: "CASCADE",
+});

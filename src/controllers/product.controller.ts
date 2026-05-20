@@ -1,0 +1,2437 @@
+// src/controllers/product.controller.ts
+import { Request, Response } from "express";
+import { sequelize } from "../config/db";
+import multer from "multer";
+import supabase from "../lib/supabase";
+import Product from "../models/product.model";
+import { Op } from "sequelize";
+import { validate as isUUID } from "uuid";
+import { QueryTypes } from "sequelize";
+import { buildPublicProductDTO } from "../utils/buildPublicProductDTO";
+import { buildPublicProductCardDTO } from "../utils/buildPublicProductCardDTO"
+import { buildSearchProductDTO } from "../utils/buildSearchProductDTO";
+import { buildCategoryArtUrl } from "../utils/categoryArt";
+import { buildMediaProxyUrl } from "../utils/mediaProxy";
+import { logEvent } from "../utils/eventLogger";
+import { can } from "../services/authorization.service";
+import { emitAppEvent } from "../lib/appEvents";
+import { notifyNewProductInCategory } from "../services/suggestions.service";
+import { generateProductCode } from "../services/productCode.service";
+import { createReviewFromPurchase, listProductReviews } from "../services/review.service";
+import { buildHomeCatalog } from "../services/homeCatalog.service";
+import {
+  uploadFromMulterFile,
+  deleteStoredImages,
+} from "../services/products/productMedia.service";
+
+
+// ===========================
+// Helpers
+// ===========================
+const toIntOrNull = (v: any) => {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+// Sanitize incoming atributos before storing in JSONB.
+//
+// Contract:
+//   • Accepts a JSON string (multipart/form-data) or a plain object.
+//   • Whitelists top-level keys — rejects unknown fields.
+//   • Prunes empty/null values so the DB stays lean: {} is the
+//     canonical "no attributes" state, never { medidas: {} }.
+//   • medidas.largo/ancho/alto are stored as positive numbers.
+//   • String fields are trimmed; empty-after-trim → omitted.
+function sanitizeAtributos(raw: any): object {
+  // Multipart sends everything as strings — parse if needed
+  if (typeof raw === "string") {
+    try { raw = JSON.parse(raw) } catch { return {} }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+
+  const safe: Record<string, any> = {}
+
+  // ── medidas ────────────────────────────────────────────────────────────────
+  if ("medidas" in raw) {
+    const val = raw.medidas
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const m: Record<string, any> = {}
+
+      // Numeric dimensions — parse, reject non-positive or NaN
+      for (const dim of ["largo", "ancho", "alto"] as const) {
+        const n = Number(val[dim])
+        if (Number.isFinite(n) && n > 0) m[dim] = n
+      }
+
+      // unidad stays a string
+      if (typeof val.unidad === "string") {
+        const u = val.unidad.trim().slice(0, 20)
+        if (u) m.unidad = u
+      }
+
+      // Only persist medidas when at least one field has a value
+      if (Object.keys(m).length > 0) safe.medidas = m
+    }
+  }
+
+  // ── string fields ──────────────────────────────────────────────────────────
+  for (const key of ["material_principal", "tecnica", "cuidados"] as const) {
+    if (!(key in raw)) continue
+    const trimmed = typeof raw[key] === "string" ? raw[key].trim().slice(0, 500) : ""
+    if (trimmed) safe[key] = trimmed
+  }
+
+  return safe
+}
+
+// ===========================
+// Multer config (imágenes producto)
+// ===========================
+const storage = multer.memoryStorage();
+const fileFilter: multer.Options["fileFilter"] = (_req, file, cb) =>
+  /^image\/(png|jpe?g|webp|gif|avif)$/.test(file.mimetype)
+    ? cb(null, true)
+    : cb(new Error("Solo imágenes permitidas"));
+
+export const uploadProductImages = multer({
+  storage,
+  limits: { files: 5, fileSize: 8 * 1024 * 1024 },
+  fileFilter,
+});
+
+// ===========================
+// Catálogos públicos
+// ===========================
+export const getCategorias = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const [rows]: any = await sequelize.query(`
+      SELECT id, nombre, imagen_url
+      FROM categorias
+      ORDER BY nombre ASC
+    `);
+
+    res.json(
+      (rows ?? []).map((row: any) => ({
+        ...row,
+        imagen_url: buildMediaProxyUrl(row.imagen_url) || buildCategoryArtUrl(row.nombre),
+      }))
+    );
+  } catch (error: any) {
+      console.error("🔥 ERROR TRENDING:");
+      console.error(error);
+      console.error(error?.message);
+      console.error(error?.parent);
+      res.status(500).json({ message: error?.message || "Error interno" });
+    } 
+};
+
+export const getClases = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre, alias FROM clases ORDER BY nombre ASC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener clases:", error);
+    res.status(500).json({ message: "Error al obtener clases" });
+  }
+};
+
+// Regiones (compatibilidad, aunque ya no sea el modelo final)
+export const getRegiones = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre FROM regiones ORDER BY nombre ASC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener regiones:", error);
+    res.status(500).json({ message: "Error al obtener regiones" });
+  }
+};
+
+export const getTelas = async (req: Request, res: Response): Promise<void> => {
+  const claseId = Number(req.query.clase_id);
+  if (!claseId) {
+    res.status(400).json({ message: "clase_id requerido" });
+    return;
+  }
+
+  try {
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre FROM telas WHERE clase_id = :claseId ORDER BY nombre ASC`,
+      { replacements: { claseId } },
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener telas:", error);
+    res.status(500).json({ message: "Error al obtener telas" });
+  }
+};
+
+export const getProductForEdit = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { id } = req.params
+    const u: any = (req as any).user
+
+    const query = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.descripcion,
+        p.precio,
+        p.stock,
+        p.activo,
+        p.categoria_id,
+        p.categoria_custom,
+        p.clase_id,
+        p.tela_id,
+        p.tela_custom,
+        p.departamento,
+        p.municipio,
+        p.departamento_custom,
+        p.municipio_custom,
+        p.accesorio_id,
+        p.accesorio_custom,
+        p.accesorio_tipo_id,
+        p.accesorio_tipo_custom,
+        p.accesorio_material_id,
+        p.accesorio_material_custom,
+        p.atributos,
+        p.imagen_url AS imagen_principal,
+        p.created_at,
+
+        COALESCE(
+          json_agg(
+            jsonb_build_object(
+              'id', pi.id,
+              'url', pi.url
+            ) ORDER BY pi.id ASC
+          ) FILTER (WHERE pi.id IS NOT NULL),
+          '[]'
+        ) AS imagenes
+
+      FROM productos p
+      LEFT JOIN producto_imagenes pi ON pi.producto_id = p.id
+      WHERE p.id = :id AND p.vendedor_id = :vid
+      GROUP BY p.id
+      LIMIT 1
+    `
+
+    const rows: any = await sequelize.query(query, {
+      replacements: { id, vid: u.id },
+      type: QueryTypes.SELECT,
+    })
+
+    if (!rows || rows.length === 0) {
+      res.status(404).json({ message: "Producto no encontrado" })
+      return
+    }
+
+    res.json({ product: rows[0] })
+    return
+  } catch (error) {
+    console.error("Error getProductForEdit:", error)
+    res.status(500).json({ message: "Error interno" })
+    return
+  }
+}
+
+export const deleteProductImage = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const u: any = (req as any).user
+    const { id, imageId } = req.params
+
+    // 1️⃣ Verificar imagen + producto + vendedor
+    const [rows]: any = await sequelize.query(
+      `
+      SELECT pi.id, pi.url
+      FROM producto_imagenes pi
+      JOIN productos p ON p.id = pi.producto_id
+      WHERE pi.id = :imageId
+        AND p.id = :productId
+        AND p.vendedor_id = :vid
+      `,
+      {
+        replacements: {
+          imageId,
+          productId: id,
+          vid: u.id,
+        },
+      }
+    )
+
+    if (!rows.length) {
+      res.status(404).json({ message: "Imagen no encontrada" })
+      return
+    }
+
+    const image = rows[0]
+
+    // 2️⃣ Eliminar de Supabase
+    const filePath = image.url.split("/productos/")[1]
+    if (filePath) {
+      await supabase.storage
+        .from("productos")
+        .remove([`products/${filePath}`])
+    }
+
+    // 3️⃣ Eliminar de BD
+    await sequelize.query(
+      `DELETE FROM producto_imagenes WHERE id = :imageId`,
+      { replacements: { imageId } }
+    )
+
+    res.json({ message: "Imagen eliminada" })
+    return
+  } catch (error) {
+    console.error("Error deleteProductImage:", error)
+    res.status(500).json({ message: "Error al eliminar imagen" })
+    return
+  }
+}
+
+// ===========================
+// Taxonomía de accesorios
+// ===========================
+export const getAccesorios = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const tipo = (req.query.tipo as string) || "normal";
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre, categoria_tipo
+       FROM accesorios
+       WHERE categoria_tipo = :tipo
+       ORDER BY nombre ASC`,
+      { replacements: { tipo } }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Error en getAccesorios:", error);
+    res.status(500).json({ message: "Error al obtener accesorios" });
+  }
+};
+
+export const getAccesorioTipos = async (req: Request, res: Response): Promise<void> => {
+  const accesorioId = Number(req.query.accesorio_id);
+  if (!accesorioId) {
+    res.status(400).json({ message: "accesorio_id requerido" });
+    return;
+  }
+
+  try {
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre FROM accesorio_tipos WHERE accesorio_id = :accesorioId ORDER BY nombre ASC`,
+      { replacements: { accesorioId } },
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener tipos de accesorio:", error);
+    res.status(500).json({ message: "Error al obtener tipos de accesorio" });
+  }
+};
+
+export const getAccesorioMateriales = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  const accesorioId = Number(req.query.accesorio_id);
+  if (!accesorioId) {
+    res.status(400).json({ message: "accesorio_id requerido" });
+    return;
+  }
+
+  try {
+    const [rows]: any = await sequelize.query(
+      `SELECT id, nombre FROM accesorio_materiales WHERE accesorio_id = :accesorioId ORDER BY nombre ASC`,
+      { replacements: { accesorioId } },
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener materiales de accesorio:", error);
+    res
+      .status(500)
+      .json({ message: "Error al obtener materiales de accesorio" });
+  }
+};
+
+// ===========================
+// CREAR PRODUCTO
+// ===========================
+export const createProduct = async (req: Request, res: Response): Promise<void> => {
+  const t = await sequelize.transaction();
+  const uploadedFiles: string[] = [];
+
+  try {
+    const u: any = (req as any).user;
+    const b = req.body;
+
+    // =====================
+    // 1️⃣ Validaciones base
+    // =====================
+    if (!u?.id) {
+      await t.rollback();
+      res.status(401).json({ message: "No autenticado" });
+      return;
+    }
+
+    if (!b.nombre || b.precio === undefined || b.stock === undefined) {
+      await t.rollback();
+      res.status(400).json({ message: "Campos obligatorios faltantes" });
+      return;
+    }
+
+    if (!b.clase_id) {
+      await t.rollback();
+      res.status(400).json({ message: "clase_id es obligatorio" });
+      return;
+    }
+
+    const precio = Number(b.precio);
+    const stock = Number(b.stock);
+
+    if (!Number.isFinite(precio) || precio <= 0) {
+      await t.rollback();
+      res.status(400).json({ message: "Precio inválido" });
+      return;
+    }
+
+    if (!Number.isInteger(stock) || stock < 0) {
+      await t.rollback();
+      res.status(400).json({ message: "Stock inválido" });
+      return;
+    }
+
+    // ======================
+    // 🔒 Validación categoría obligatoria
+    // ======================
+    if (
+      (!b.categoria_id || b.categoria_id === "") &&
+      (!b.categoria_custom || String(b.categoria_custom).trim() === "")
+    ) {
+      await t.rollback();
+      res.status(400).json({
+        message: "Debe seleccionar una categoría o ingresar una personalizada",
+      });
+      return;
+    }
+
+    // ======================
+    // 🔒 Validación seller_sku (opcional)
+    // ======================
+    const rawSku = b.seller_sku as string | undefined;
+    const sellerSku: string | null = rawSku && rawSku.trim() !== "" ? rawSku.trim() : null;
+
+    if (sellerSku !== null && !/^[A-Za-z0-9\-_]{1,100}$/.test(sellerSku)) {
+      await t.rollback();
+      res.status(400).json({
+        message: "El SKU solo puede contener letras, números, guiones (-) y guiones bajos (_). Máximo 100 caracteres.",
+        field: "seller_sku",
+      });
+      return;
+    }
+
+    // ======================
+    // 🔑 Generar internal_code
+    // Pre-generates before the transaction's INSERT block.
+    // The service already retries internally on pre-flight collisions.
+    // A second retry layer at INSERT time (savepoint-based) handles the
+    // astronomically-rare race where two concurrent requests pass the
+    // pre-flight check with the same code.
+    // ======================
+    let internalCode: string;
+    try {
+      internalCode = await generateProductCode({
+        departamento: b.departamento || null,
+        categoriaId: b.categoria_id ? Number(b.categoria_id) : null,
+        categoriaCustom: b.categoria_custom || null,
+        createdAt: new Date(),
+      });
+    } catch (codeErr) {
+      await t.rollback();
+      console.error("❌ generateProductCode failed:", codeErr);
+      res.status(500).json({ message: "Error generando código de producto" });
+      return;
+    }
+
+    // =====================
+    // 2️⃣ Subir imágenes
+    // =====================
+    console.log("[createProduct] content-type:", req.headers["content-type"]);
+    console.log("[createProduct] body keys:", Object.keys(req.body || {}));
+    console.log(
+      "[createProduct] req.files raw:",
+      Array.isArray(req.files)
+        ? (req.files as any[]).map((f) => ({
+            fieldname: f.fieldname,
+            originalname: f.originalname,
+            mimetype: f.mimetype,
+            size: f.size,
+            bufferLength: f.buffer?.length ?? 0,
+          }))
+        : req.files
+    );
+
+    const files = (Array.isArray(req.files) ? req.files : []) as Express.Multer.File[];
+    console.log(`[createProduct] files count: ${files.length}`);
+
+    const urls: string[] = [];
+
+    for (const f of files) {
+      const stored = await uploadFromMulterFile(f);
+      console.log(`[createProduct] uploaded → path=${stored.storagePath} url=${stored.publicUrl}`);
+      uploadedFiles.push(stored.storagePath);
+      urls.push(stored.publicUrl);
+    }
+
+    console.log("[createProduct] all uploaded URLs:", urls);
+
+    const imagenPrincipal = urls[0] ?? null;
+
+    // Galería — ALL uploaded images go into producto_imagenes so that
+    // getProductForEdit (which only reads producto_imagenes) returns the
+    // full set. imagen_url still holds urls[0] for catalog/thumbnail use.
+    const galeria = urls;
+
+    // =====================
+    // 3️⃣ Insertar producto (ATÓMICO) — con retry para internal_code
+    //
+    // Strategy: wrap each INSERT attempt in a named SAVEPOINT.
+    // If the DB unique constraint fires on internal_code (race condition
+    // survivor from the pre-flight check), we ROLLBACK TO SAVEPOINT,
+    // regenerate a fresh code, and retry — without aborting the outer
+    // transaction.  Up to MAX_CODE_RETRIES attempts are made.
+    // A seller_sku violation is NOT retried: it is a user input error
+    // and must bubble up to the outer catch immediately.
+    // =====================
+    const MAX_CODE_RETRIES = 3;
+    let inserted: any = null;
+
+    for (let codeAttempt = 0; codeAttempt < MAX_CODE_RETRIES; codeAttempt++) {
+
+      await sequelize.query(
+        `SAVEPOINT sp_product_insert`,
+        { transaction: t }
+      );
+
+      try {
+        const [result]: any = await sequelize.query(
+          `
+          INSERT INTO productos (
+            vendedor_id, nombre, descripcion, precio, stock,
+            categoria_id, categoria_custom,
+            clase_id, tela_id, tela_custom,
+            departamento, municipio, departamento_custom, municipio_custom,
+            accesorio_id, accesorio_custom,
+            accesorio_tipo_id, accesorio_tipo_custom,
+            accesorio_material_id, accesorio_material_custom,
+            imagen_url, activo,
+            internal_code, seller_sku,
+            atributos,
+            created_at, updated_at
+          ) VALUES (
+            :vendedor_id, :nombre, :descripcion, :precio, :stock,
+            :categoria_id, :categoria_custom,
+            :clase_id, :tela_id, :tela_custom,
+            :departamento, :municipio, :departamento_custom, :municipio_custom,
+            :accesorio_id, :accesorio_custom,
+            :accesorio_tipo_id, :accesorio_tipo_custom,
+            :accesorio_material_id, :accesorio_material_custom,
+            :imagen_url, :activo,
+            :internal_code, :seller_sku,
+            :atributos,
+            now(), now()
+          ) RETURNING id, internal_code
+          `,
+          {
+            transaction: t,
+            replacements: {
+              vendedor_id: u.id,
+
+              nombre: b.nombre,
+              descripcion: b.descripcion || null,
+              precio,
+              stock,
+
+              // Categoría
+              categoria_id:
+                b.categoria_id !== undefined && b.categoria_id !== null && b.categoria_id !== ""
+                  ? Number(b.categoria_id)
+                  : null,
+              categoria_custom: b.categoria_custom || null,
+
+              // Textiles
+              clase_id:
+                b.clase_id !== undefined && b.clase_id !== null && b.clase_id !== ""
+                  ? Number(b.clase_id)
+                  : null,
+
+              tela_id:
+                b.tela_id !== undefined && b.tela_id !== null && b.tela_id !== ""
+                  ? Number(b.tela_id)
+                  : null,
+
+              tela_custom: b.tela_custom || null,
+
+              // Origen
+              departamento: b.departamento || null,
+              municipio: b.municipio || null,
+              departamento_custom: b.departamento_custom || null,
+              municipio_custom: b.municipio_custom || null,
+
+              // Accesorios
+              accesorio_id:
+                b.accesorio_id !== undefined && b.accesorio_id !== null && b.accesorio_id !== ""
+                  ? Number(b.accesorio_id)
+                  : null,
+
+              accesorio_custom: b.accesorio_custom || null,
+
+              accesorio_tipo_id:
+                b.accesorio_tipo_id !== undefined &&
+                b.accesorio_tipo_id !== null &&
+                b.accesorio_tipo_id !== ""
+                  ? Number(b.accesorio_tipo_id)
+                  : null,
+
+              accesorio_tipo_custom: b.accesorio_tipo_custom || null,
+
+              accesorio_material_id:
+                b.accesorio_material_id !== undefined &&
+                b.accesorio_material_id !== null &&
+                b.accesorio_material_id !== ""
+                  ? Number(b.accesorio_material_id)
+                  : null,
+
+              accesorio_material_custom: b.accesorio_material_custom || null,
+
+              // Imagen principal
+              imagen_url: imagenPrincipal,
+
+              // 🔒 decisión explícita de negocio
+              activo: false,
+
+              // Identificadores
+              internal_code: internalCode,
+              seller_sku: sellerSku,
+
+              // Atributos opcionales (JSONB) — validated + sanitised before INSERT
+              atributos: JSON.stringify(sanitizeAtributos(b.atributos)),
+            },
+          }
+        );
+
+        // INSERT succeeded — release the savepoint and exit the retry loop
+        await sequelize.query(`RELEASE SAVEPOINT sp_product_insert`, { transaction: t });
+        inserted = result;
+        break;
+
+      } catch (insertErr: any) {
+        // Always rollback to the savepoint first to restore the transaction
+        // to a usable state before we decide what to do next
+        await sequelize.query(
+          `ROLLBACK TO SAVEPOINT sp_product_insert`,
+          { transaction: t }
+        );
+
+        const isUniqueViolation =
+          insertErr?.parent?.code === "23505" ||
+          insertErr?.name === "SequelizeUniqueConstraintError";
+
+        const constraint: string = insertErr?.parent?.constraint ?? "";
+        const isCodeCollision = isUniqueViolation && !constraint.includes("seller_sku");
+
+        if (isCodeCollision && codeAttempt < MAX_CODE_RETRIES - 1) {
+          // internal_code race condition — regenerate and retry
+          console.warn(
+            `⚠️ internal_code collision on attempt ${codeAttempt + 1} — regenerating`
+          );
+          try {
+            internalCode = await generateProductCode({
+              departamento: b.departamento || null,
+              categoriaId: b.categoria_id ? Number(b.categoria_id) : null,
+              categoriaCustom: b.categoria_custom || null,
+              createdAt: new Date(),
+            });
+          } catch (regenerateErr) {
+            // Code generation failed during retry — escalate
+            throw regenerateErr;
+          }
+          continue;
+        }
+
+        // seller_sku collision, unrelated constraint, or retries exhausted
+        // Bubble up to the outer catch for proper error response
+        throw insertErr;
+      }
+    }
+
+    // =====================
+    // 4️⃣ Insertar galería de imágenes (si hay)
+    // =====================
+    if (galeria.length > 0) {
+      for (const url of galeria) {
+        await sequelize.query(
+          `INSERT INTO producto_imagenes (producto_id, url, created_at)
+           VALUES (:producto_id, :url, now())`,
+          {
+            transaction: t,
+            replacements: {
+              producto_id: inserted[0].id,
+              url,
+            },
+          }
+        );
+      }
+    }
+
+    await t.commit();
+
+    // Notify buyers who follow this category — fire-and-forget, never throws
+    const categoryId =
+      b.categoria_id !== undefined && b.categoria_id !== null && b.categoria_id !== ""
+        ? Number(b.categoria_id)
+        : null;
+    notifyNewProductInCategory(inserted[0].id, categoryId, u.id).catch(() => {});
+
+    res.status(201).json({
+      id: inserted[0].id,
+      internal_code: inserted[0].internal_code,
+      imagenes: urls,
+      activo: false,
+    });
+  } catch (error: any) {
+    console.error("❌ Error en createProduct (atomic):", error);
+
+    await t.rollback();
+
+    // =====================
+    // 🧹 Limpieza de imágenes huérfanas
+    // =====================
+    if (uploadedFiles.length > 0) {
+      await deleteStoredImages(uploadedFiles).catch(() => undefined);
+    }
+
+    // ─── Unique constraint errors ───────────────────────────────────────────
+    // Sequelize wraps PG unique_violation (code 23505) as UniqueConstraintError.
+    // Inspect the constraint name to distinguish seller_sku from internal_code.
+    if (
+      error?.name === "SequelizeUniqueConstraintError" ||
+      error?.parent?.code === "23505"
+    ) {
+      const constraint: string = error?.parent?.constraint ?? error?.fields?.join(",") ?? "";
+
+      if (constraint.includes("seller_sku")) {
+        res.status(409).json({
+          message: "Ya tienes un producto con ese código SKU. Usa un código diferente.",
+          field: "seller_sku",
+        });
+        return;
+      }
+
+      // internal_code collision survived the pre-flight — astronomically rare.
+      // Surface a generic error; the caller can retry the full request once.
+      res.status(409).json({
+        message: "Conflicto al generar el código interno. Por favor intenta de nuevo.",
+        code: "INTERNAL_CODE_COLLISION",
+      });
+      return;
+    }
+
+    res.status(500).json({ message: "Error al crear producto" });
+  }
+};
+
+// ===========================
+// Productos del vendedor
+// ===========================
+export const getSellerProducts = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const u: any = (req as any).user;
+
+      const [rows]: any = await sequelize.query(
+        `SELECT id, nombre, precio, stock, activo, imagen_url,
+                internal_code, seller_sku
+        FROM productos
+        WHERE vendedor_id = :vid
+        ORDER BY activo ASC, created_at DESC`,
+        { replacements: { vid: u.id } }
+      );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Error al obtener productos:", error);
+    res.status(500).json({ message: "Error al obtener productos" });
+  }
+};
+
+// ===========================
+// Obtener producto por ID (PÚBLICO)
+// ===========================
+export const getProductById = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    // =====================================================
+    // 🔒 VALIDACIÓN ROBUSTA DE ID (merge de ambas versiones)
+    // =====================================================
+    const idParam = req.params.id;
+    const idRaw = Array.isArray(idParam) ? idParam[0] : idParam;
+
+    if (!idRaw || !isUUID(idRaw)) {
+      res.status(400).json({ message: "ID de producto inválido" });
+      return;
+    }
+
+    const productId = idRaw;
+
+    // =====================================================
+    // 🔎 PRODUCTO DETALLE COMPLETO
+    // =====================================================
+    const productQuery = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.descripcion,
+        p.precio,
+        p.imagen_url AS imagen_principal,
+        p.departamento,
+        p.municipio,
+        p.rating_avg,
+        p.rating_count,
+        p.internal_code,
+
+        -- Categoria estructurada
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre,
+
+        -- Clase y Tela
+        cl.id AS clase_id,
+        cl.nombre AS clase_nombre,
+        t.id AS tela_id,
+        t.nombre AS tela_nombre,
+
+        -- Vendedor estructurado
+        v.id AS vendedor_perfil_id,
+        v.user_id AS vendedor_id,
+        v.nombre_comercio,
+        v.logo,
+        v.whatsapp_numero,
+
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'id', pi.id,
+              'url', pi.url
+            )
+          ) FILTER (WHERE pi.id IS NOT NULL),
+          '[]'
+        ) AS imagenes
+
+      FROM productos p
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      LEFT JOIN clases cl ON cl.id = p.clase_id
+      LEFT JOIN telas t ON t.id = p.tela_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      LEFT JOIN producto_imagenes pi ON pi.producto_id = p.id
+
+      WHERE p.id = :id
+      AND p.activo = true
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+
+      GROUP BY
+        p.id,
+        p.internal_code,
+        c.id,
+        c.nombre,
+        cl.id,
+        cl.nombre,
+        t.id,
+        t.nombre,
+        v.id,
+        v.user_id,
+        v.nombre_comercio,
+        v.logo,
+        v.whatsapp_numero
+
+      LIMIT 1
+    `;
+
+    const rows: any = await sequelize.query(productQuery, {
+      replacements: { id: productId },
+      type: QueryTypes.SELECT,
+    });
+
+    if (!rows || rows.length === 0) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    const rawProduct = rows[0];
+
+    // =====================================================
+    // 📊 REGISTRAR VISTA (no bloquea respuesta)
+    // =====================================================
+    try {
+      await sequelize.query(
+        `
+        INSERT INTO product_views (product_id, ip_address, user_agent)
+        VALUES (:product_id, :ip, :ua)
+        `,
+        {
+          replacements: {
+            product_id: rawProduct.id,
+            ip: req.ip || null,
+            ua: req.headers["user-agent"] || null,
+          },
+          type: QueryTypes.INSERT,
+        }
+      );
+    } catch (viewError) {
+      console.error("Error registrando vista:", viewError);
+    }
+
+    // =====================================================
+    // 🧱 DTO PÚBLICO
+    // =====================================================
+    const product = buildPublicProductDTO(rawProduct);
+
+    // 🔒 Limitar galería a máximo 4 imágenes adicionales
+    if (Array.isArray(product.imagenes)) {
+      product.imagenes = product.imagenes.slice(0, 4);
+    }
+
+    // =====================================================
+    // 📈 EVENTO ANALÍTICO
+    // =====================================================
+    await logEvent({
+      type: "product_view",
+      user_id: (req as any).user?.id ?? null,
+      product_id: productId,
+    });
+
+    // =====================================================
+    // 🔎 PRODUCTOS RELACIONADOS (CardDTO)
+    // =====================================================
+    const relatedQuery = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.precio,
+        p.imagen_url,
+        p.rating_avg,
+        p.rating_count,
+        p.departamento,
+        p.municipio,
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre
+      FROM productos p
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      WHERE p.categoria_id = (
+        SELECT categoria_id FROM productos WHERE id = :id
+      )
+      AND p.id != :id
+      AND p.activo = true
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+      ORDER BY p.created_at DESC
+      LIMIT 12
+    `;
+
+    const relatedRows: any = await sequelize.query(relatedQuery, {
+      replacements: { id: productId },
+      type: QueryTypes.SELECT,
+    });
+
+    const related = (relatedRows || []).map((r: any) =>
+      buildPublicProductCardDTO(r)
+    );
+
+    // =====================================================
+    // 📦 RESPUESTA FINAL
+    // =====================================================
+    res.json({
+      product: {
+        ...product,
+        // Fields appended outside the DTO to keep the DTO contract stable.
+        internal_code: rawProduct.internal_code ?? null,
+        clase: rawProduct.clase_id
+          ? { id: rawProduct.clase_id, nombre: rawProduct.clase_nombre }
+          : null,
+        tela: rawProduct.tela_id
+          ? { id: rawProduct.tela_id, nombre: rawProduct.tela_nombre }
+          : null,
+        vendedor: {
+          ...product.vendedor,
+          whatsapp: rawProduct.whatsapp_numero ?? null,
+        },
+      },
+      related,
+    });
+
+    // =====================================================
+    // 🚀 ONBOARDING: emitir product_viewed (fire-and-forget)
+    // Solo para sellers que aún no están ACTIVATED.
+    // vendedor_id = users.id, vendedor_perfil_id = vendedor_perfil.id
+    // =====================================================
+    if (rawProduct.vendedor_id && rawProduct.vendedor_perfil_id) {
+      setImmediate(async () => {
+        try {
+          const { VendedorPerfil } = await import('../models/VendedorPerfil');
+          const perfil = await VendedorPerfil.findByPk(rawProduct.vendedor_perfil_id, {
+            attributes: ['onboarding_state'],
+          });
+          if (perfil && perfil.onboarding_state !== 'ACTIVATED') {
+            const { emitEvent } = await import('../lib/onboardingEvents');
+            emitEvent('product_viewed', {
+              userId:           rawProduct.vendedor_id,
+              vendedorPerfilId: rawProduct.vendedor_perfil_id,
+              productId,
+              productName:      rawProduct.nombre,
+            });
+          }
+        } catch (err) {
+          console.error('[onboarding] product_viewed emit error', err);
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error("Error en getProductById:", error);
+    res.status(500).json({
+      message: "Error al obtener producto",
+    });
+  }
+};
+
+// ===========================
+// Obtener producto por internal_code (PÚBLICO — QR / share link)
+// ===========================
+export const getProductByCode = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const codeParam = req.params.internal_code;
+    const code = Array.isArray(codeParam) ? codeParam[0] : codeParam;
+
+    // Basic sanity check — internal_code is alphanumeric + hyphens, 10–30 chars
+    if (!code || !/^[A-Z0-9\-]{8,32}$/i.test(code)) {
+      res.status(400).json({ message: "Código de producto inválido" });
+      return;
+    }
+
+    const productQuery = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.descripcion,
+        p.precio,
+        p.imagen_url AS imagen_principal,
+        p.departamento,
+        p.municipio,
+        p.rating_avg,
+        p.rating_count,
+        p.internal_code,
+
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre,
+
+        v.user_id AS vendedor_id,
+        v.nombre_comercio,
+        v.logo,
+        v.whatsapp_numero,
+
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'id', pi.id,
+              'url', pi.url
+            )
+          ) FILTER (WHERE pi.id IS NOT NULL),
+          '[]'
+        ) AS imagenes
+
+      FROM productos p
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      LEFT JOIN producto_imagenes pi ON pi.producto_id = p.id
+
+      WHERE p.internal_code = :code
+      AND p.activo = true
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+
+      GROUP BY
+        p.id,
+        p.internal_code,
+        c.id,
+        c.nombre,
+        v.user_id,
+        v.nombre_comercio,
+        v.logo,
+        v.whatsapp_numero
+
+      LIMIT 1
+    `;
+
+    const rows: any = await sequelize.query(productQuery, {
+      replacements: { code: code.toUpperCase() },
+      type: QueryTypes.SELECT,
+    });
+
+    if (!rows || rows.length === 0) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    const rawProduct = rows[0];
+
+    // ── Registrar vista con source: 'code' (no bloquea respuesta) ──
+    try {
+      await sequelize.query(
+        `INSERT INTO product_views (product_id, ip_address, user_agent, source)
+         VALUES (:product_id, :ip, :ua, 'code')`,
+        {
+          replacements: {
+            product_id: rawProduct.id,
+            ip: req.ip || null,
+            ua: req.headers["user-agent"] || null,
+          },
+          type: QueryTypes.INSERT,
+        }
+      );
+    } catch (viewError) {
+      console.error("Error registrando vista por código:", viewError);
+    }
+
+    const product = buildPublicProductDTO(rawProduct);
+
+    if (Array.isArray(product.imagenes)) {
+      product.imagenes = product.imagenes.slice(0, 4);
+    }
+
+    await logEvent({
+      type: "product_view",
+      user_id: (req as any).user?.id ?? null,
+      product_id: rawProduct.id,
+    });
+
+    const relatedQuery = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.precio,
+        p.imagen_url,
+        p.rating_avg,
+        p.rating_count,
+        p.departamento,
+        p.municipio,
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre
+      FROM productos p
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      WHERE p.categoria_id = (
+        SELECT categoria_id FROM productos WHERE id = :id
+      )
+      AND p.id != :id
+      AND p.activo = true
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+      ORDER BY p.created_at DESC
+      LIMIT 12
+    `;
+
+    const relatedRows: any = await sequelize.query(relatedQuery, {
+      replacements: { id: rawProduct.id },
+      type: QueryTypes.SELECT,
+    });
+
+    const related = (relatedRows || []).map((r: any) =>
+      buildPublicProductCardDTO(r)
+    );
+
+    res.json({
+      product: {
+        ...product,
+        internal_code: rawProduct.internal_code ?? null,
+        vendedor: {
+          ...product.vendedor,
+          whatsapp: rawProduct.whatsapp_numero ?? null,
+        },
+      },
+      related,
+    });
+
+  } catch (error) {
+    console.error("Error en getProductByCode:", error);
+    res.status(500).json({ message: "Error al obtener producto" });
+  }
+};
+
+// ===========================
+// Actualizar producto
+// ===========================
+export const updateProduct = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  const uploadedImagePaths: string[] = [];
+  try {
+    const u: any = (req as any).user;
+    const b: any = req.body;
+    const id = req.params.id;
+
+    // 🔎 Logs útiles
+    console.log("[updateProduct] content-type:", req.headers["content-type"]);
+    console.log("[updateProduct] body keys:", Object.keys(b || {}));
+    console.log(
+      "[updateProduct] files:",
+      Array.isArray(req.files)
+        ? (req.files as any[]).map((f) => ({
+            fieldname: f.fieldname,
+            originalname: f.originalname,
+            mimetype: f.mimetype,
+            size: f.size,
+          }))
+        : req.files
+    );
+
+    // 1️⃣ Verificar pertenencia
+    const [rows]: any = await sequelize.query(
+      `SELECT id FROM productos WHERE id = :id AND vendedor_id = :vid`,
+      { replacements: { id, vid: u.id } }
+    );
+
+    if (!rows || rows.length === 0) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    // 2️⃣ Validaciones seguras
+    if (b.nombre == null || b.nombre === "") {
+      res.status(400).json({ message: "nombre es obligatorio" });
+      return;
+    }
+
+    if (b.precio == null || b.precio === "") {
+      res.status(400).json({ message: "precio es obligatorio" });
+      return;
+    }
+
+    if (b.stock == null || b.stock === "") {
+      res.status(400).json({ message: "stock es obligatorio" });
+      return;
+    }
+
+    const precio = Number(b.precio);
+    const stock = Number(b.stock);
+
+    if (!Number.isFinite(precio) || precio <= 0) {
+      res.status(400).json({ message: "Precio inválido" });
+      return;
+    }
+
+    if (!Number.isInteger(stock) || stock < 0) {
+      res.status(400).json({ message: "Stock inválido" });
+      return;
+    }
+
+    // 🔒 Validación categoría obligatoria
+    if (
+      (!b.categoria_id || b.categoria_id === "") &&
+      (!b.categoria_custom || String(b.categoria_custom).trim() === "")
+    ) {
+      res.status(400).json({
+        message: "Debe seleccionar una categoría o ingresar una personalizada",
+      });
+      return;
+    }
+
+    const activo =
+      b.activo === "true" ||
+      b.activo === true ||
+      b.activo === 1 ||
+      b.activo === "1";
+
+    // 3️⃣ Subir imágenes nuevas
+    const files = (Array.isArray(req.files) ? req.files : []) as Express.Multer.File[];
+    const uploadedImageUrls: string[] = [];
+    const uploadedImagePaths: string[] = [];
+
+    for (const f of files) {
+      const stored = await uploadFromMulterFile(f);
+      console.log(`[updateProduct] uploaded → path=${stored.storagePath} url=${stored.publicUrl}`);
+      uploadedImageUrls.push(stored.publicUrl);
+      uploadedImagePaths.push(stored.storagePath);
+    }
+
+    // 4️⃣ UPDATE principal del producto
+    await sequelize.query(
+      `UPDATE productos
+       SET
+         nombre = :nombre,
+         descripcion = :descripcion,
+         precio = :precio,
+         stock = :stock,
+         categoria_id = :categoria_id,
+         categoria_custom = :categoria_custom,
+         clase_id = :clase_id,
+         tela_id = :tela_id,
+         tela_custom = :tela_custom,
+         departamento = :departamento,
+         municipio = :municipio,
+         departamento_custom = :departamento_custom,
+         municipio_custom = :municipio_custom,
+         accesorio_id = :accesorio_id,
+         accesorio_custom = :accesorio_custom,
+         accesorio_tipo_id = :accesorio_tipo_id,
+         accesorio_tipo_custom = :accesorio_tipo_custom,
+         accesorio_material_id = :accesorio_material_id,
+         accesorio_material_custom = :accesorio_material_custom,
+         atributos = :atributos,
+         activo = :activo,
+         updated_at = now()
+       WHERE id = :id AND vendedor_id = :vid`,
+      {
+        replacements: {
+          id,
+          vid: u.id,
+
+          nombre: b.nombre,
+          descripcion: b.descripcion || null,
+          precio,
+          stock,
+
+          categoria_id: b.categoria_id ? Number(b.categoria_id) : null,
+          categoria_custom: b.categoria_custom || null,
+
+          clase_id: b.clase_id ? Number(b.clase_id) : null,
+          tela_id: b.tela_id ? Number(b.tela_id) : null,
+          tela_custom: b.tela_custom || null,
+
+          departamento: b.departamento || null,
+          municipio: b.municipio || null,
+          departamento_custom: b.departamento_custom || null,
+          municipio_custom: b.municipio_custom || null,
+
+          accesorio_id: b.accesorio_id ? Number(b.accesorio_id) : null,
+          accesorio_custom: b.accesorio_custom || null,
+
+          accesorio_tipo_id: b.accesorio_tipo_id ? Number(b.accesorio_tipo_id) : null,
+          accesorio_tipo_custom: b.accesorio_tipo_custom || null,
+
+          accesorio_material_id: b.accesorio_material_id ? Number(b.accesorio_material_id) : null,
+          accesorio_material_custom: b.accesorio_material_custom || null,
+
+          atributos: JSON.stringify(sanitizeAtributos(b.atributos)),
+
+          activo,
+        },
+      }
+    );
+
+    // 5️⃣ Guardar imágenes adicionales
+    if (uploadedImageUrls.length > 0) {
+      for (const url of uploadedImageUrls) {
+        await sequelize.query(
+          `
+          INSERT INTO producto_imagenes (producto_id, url, created_at)
+          VALUES (:producto_id, :url, now())
+          `,
+          {
+            replacements: {
+              producto_id: id,
+              url,
+            },
+          }
+        );
+      }
+
+      // 6️⃣ ACTUALIZAR imagen principal con la primera nueva
+      await sequelize.query(
+        `
+        UPDATE productos
+        SET imagen_url = :imagen_url,
+            updated_at = now()
+        WHERE id = :id AND vendedor_id = :vid
+        `,
+        {
+          replacements: {
+            id,
+            vid: u.id,
+            imagen_url: uploadedImageUrls[0],
+          },
+        }
+      );
+    }
+
+    res.json({
+      message: "Producto actualizado correctamente",
+      imagenesAgregadas: uploadedImageUrls.length,
+      imagenPrincipalActualizada: uploadedImageUrls.length > 0,
+    });
+
+  } catch (e) {
+    console.error("Error en updateProduct:", e);
+    if (uploadedImagePaths.length > 0) {
+      await deleteStoredImages(uploadedImagePaths).catch(() => undefined);
+    }
+    res.status(500).json({
+      message: "Error al actualizar producto",
+      error: String(e),
+    });
+  }
+};
+
+// ===========================
+// Cambiar imagen principal (VENDEDOR)
+// ===========================
+export const setPrincipalImage = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const u: any = (req as any).user;
+    const { id } = req.params;
+    const { imagen_url } = req.body;
+
+    if (!imagen_url) {
+      res.status(400).json({ message: "imagen_url requerida" });
+      return;
+    }
+
+    // 1️⃣ Verificar que el producto pertenece al vendedor
+    const [rows]: any = await sequelize.query(
+      `
+      SELECT id
+      FROM productos
+      WHERE id = :id AND vendedor_id = :vid
+      `,
+      {
+        replacements: { id, vid: u.id },
+      }
+    );
+
+    if (!rows.length) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    // 2️⃣ Actualizar imagen principal
+    await sequelize.query(
+      `
+      UPDATE productos
+      SET imagen_url = :imagen_url,
+          updated_at = now()
+      WHERE id = :id AND vendedor_id = :vid
+      `,
+      {
+        replacements: {
+          id,
+          vid: u.id,
+          imagen_url,
+        },
+      }
+    );
+
+    res.json({
+      message: "Imagen principal actualizada correctamente",
+    });
+
+  } catch (error) {
+    console.error("Error en setPrincipalImage:", error);
+    res.status(500).json({
+      message: "Error al actualizar imagen principal",
+    });
+  }
+};
+
+// ===========================
+// Eliminar producto
+// ===========================
+export const deleteProduct = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const u: any = (req as any).user;
+
+    const [rows] = await sequelize.query(
+      `
+      SELECT id
+      FROM productos
+      WHERE id = :id
+      AND vendedor_id = :vid
+    `,
+      { replacements: { id: req.params.id, vid: u.id } }
+    );
+
+    if (!rows.length) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    await sequelize.query(
+      `DELETE FROM productos WHERE id = :id AND vendedor_id = :vid`,
+      { replacements: { id: req.params.id, vid: u.id } }
+    );
+
+    res.json({ message: "Producto eliminado" });
+  } catch (error) {
+    console.error("Error al eliminar producto:", error);
+    res.status(500).json({ message: "Error al eliminar producto" });
+  }
+};
+
+// ===========================
+// Activar / desactivar producto
+// ===========================
+export const toggleProductActive = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const u: any = (req as any).user;
+    const { activo } = req.body;
+    const productId = req.params.id;
+
+    // 🔐 Validar autenticación
+    if (!u?.id) {
+      res.status(401).json({ message: "No autenticado" });
+      return;
+    }
+
+    // 🔎 Validar parámetro
+    if (!productId) {
+      res.status(400).json({ message: "ID de producto requerido" });
+      return;
+    }
+
+    const activar = Boolean(activo);
+
+    // =====================================================
+    // 🔐 Verificar estado administrativo del vendedor
+    // =====================================================
+    const vendedorEstado: any = await sequelize.query(
+      `
+      SELECT estado_validacion, estado_admin
+      FROM vendedor_perfil
+      WHERE user_id = :userId
+      `,
+      {
+        replacements: { userId: u.id },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    if (!vendedorEstado.length) {
+      res.status(403).json({ message: "Perfil de vendedor no encontrado" });
+      return;
+    }
+
+    const perfil = vendedorEstado[0];
+
+    // 🚨 Solo validar si intenta ACTIVAR
+    if (activar === true) {
+
+      // 🔴 Suspensión administrativa
+      if (perfil.estado_admin === "suspendido") {
+        res.status(403).json({
+          message: "Tu comercio está suspendido y no puede activar productos.",
+        });
+        return;
+      }
+
+      // 🔒 No aprobado legalmente
+      if (perfil.estado_validacion !== "aprobado") {
+        res.status(403).json({
+          message: "No puedes activar productos hasta que tu comercio sea aprobado.",
+        });
+        return;
+      }
+    }
+
+    // =====================================================
+    // 🔎 Verificar que el producto pertenece al vendedor
+    // =====================================================
+    const producto: any = await sequelize.query(
+      `
+      SELECT id, nombre
+      FROM productos
+      WHERE id = :id AND vendedor_id = :vid
+      `,
+      {
+        replacements: { id: productId, vid: u.id },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    if (!producto.length) {
+      res.status(404).json({ message: "Producto no encontrado" });
+      return;
+    }
+
+    // =====================================================
+    // 🔄 Actualizar estado
+    // =====================================================
+    await sequelize.query(
+      `
+      UPDATE productos
+      SET activo = :activo,
+          updated_at = now()
+      WHERE id = :id AND vendedor_id = :vid
+      `,
+      {
+        replacements: {
+          id: productId,
+          vid: u.id,
+          activo: activar,
+        },
+      }
+    );
+
+    // Notify followers only when activating — deactivation is not a feed event
+    if (activar) {
+      emitAppEvent("product.created", {
+        sellerId:    u.id,
+        productId:   productId as string,
+        productName: producto[0].nombre,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: activar
+        ? "Producto activado correctamente"
+        : "Producto desactivado correctamente",
+      activo: activar,
+    });
+
+  } catch (error) {
+    console.error("❌ Error en toggleProductActive:", error);
+    res.status(500).json({
+      message: "Error al cambiar estado del producto",
+    });
+  }
+};
+
+// ===========================
+// Productos por categoría (slug)
+// ===========================
+export const getProductsByCategory = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const { slug } = req.params;
+
+    if (!slug || typeof slug !== "string") {
+      res.status(400).json({ message: "Slug inválido" });
+      return;
+    }
+
+    // 1️⃣ Buscar categorías relacionadas (match flexible)
+    const categorias: any = await sequelize.query(
+      `
+      SELECT id, nombre
+      FROM categorias
+      WHERE LOWER(nombre) LIKE :slug
+      `,
+      {
+        replacements: {
+          slug: `%${slug.toLowerCase()}%`,
+        },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    if (!categorias.length) {
+      res.status(404).json({ message: "Categoría no encontrada" });
+      return;
+    }
+
+    const categoriaIds = categorias.map((c: any) => c.id);
+
+    // 2️⃣ Traer productos SOLO de vendedores activos y aprobados
+    const productos: any = await sequelize.query(
+      `
+      SELECT
+        p.id,
+        p.nombre,
+        p.precio,
+        p.descripcion,
+        p.imagen_url,
+        p.rating_avg,
+        p.rating_count,
+        p.created_at,
+        c.nombre AS categoria
+      FROM productos p
+      JOIN categorias c ON c.id = p.categoria_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      WHERE
+        p.activo = true
+        AND v.estado_validacion = 'aprobado'
+        AND v.estado_admin = 'activo'
+        AND p.categoria_id IN (:categoriaIds)
+      ORDER BY p.created_at DESC
+      `,
+      {
+        replacements: { categoriaIds },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    res.json({
+      success: true,
+      categoria: categorias[0], // solo para título principal
+      total: productos.length,
+      productos,
+    });
+
+  } catch (error) {
+    console.error("Error al obtener productos por categoría:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener productos",
+    });
+  }
+};
+
+// ===========================
+// Productos nuevos
+// ===========================
+export const getNewProducts = async (
+  _req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const query = `
+      SELECT
+        p.id,
+        p.nombre,
+        p.precio,
+        p.imagen_url,
+        p.rating_avg,
+        p.rating_count,
+        p.departamento,
+        p.municipio,
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre
+      FROM productos p
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      WHERE p.activo = true
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+        AND p.imagen_url IS NOT NULL
+      ORDER BY p.created_at DESC
+      LIMIT 20
+    `;
+
+    const rows: any = await sequelize.query(query, {
+      type: QueryTypes.SELECT,
+    });
+
+    const data = (rows || []).map((r: any) =>
+      buildPublicProductCardDTO(r)
+    );
+
+    res.json(data);
+  } catch (error) {
+    console.error("Error al obtener nuevos productos:", error);
+    res.status(500).json({ message: "Error al obtener nuevos productos" });
+  }
+};
+
+// ===========================
+// Filtros dinámicos / búsqueda avanzada
+// ===========================
+export const getFilteredProducts = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const {
+      search,
+      categoria_id,
+      clase_id,
+      tela_id,
+
+      // accesorios
+      accesorio_id,
+      accesorio_tipo_id,
+      accesorio_material_id,
+
+      // origen
+      departamento,
+      municipio,
+
+      // precio
+      precioMin,
+      precioMax,
+
+      ratingMin,
+
+      // orden
+      sort,
+
+      // paginación
+      page = "1",
+      limit = "40",
+    } = req.query as any;
+
+    // ============================
+    // 📄 Paginación segura
+    // ============================
+    const pageNumber = Math.max(Number(page) || 1, 1);
+    const limitNumber = Math.min(Math.max(Number(limit) || 40, 1), 60);
+    const offset = (pageNumber - 1) * limitNumber;
+
+    const whereConditions: string[] = [
+      "p.activo = true",
+      "v.estado_validacion = 'aprobado'",
+      "v.estado_admin = 'activo'"
+    ];
+
+    const replacements: any = {
+      limit: limitNumber,
+      offset,
+    };
+
+    // ============================
+    // 🔎 Search extendido
+    // ============================
+    if (search && String(search).trim() !== "") {
+      whereConditions.push(`
+        p.search_vector @@ plainto_tsquery('spanish', :search)
+      `);
+    
+      replacements.search = String(search).trim();
+    }        
+
+    // ============================
+    // 📂 Filtros estructurados
+    // ============================
+    if (categoria_id) {
+      whereConditions.push("p.categoria_id = :categoria_id");
+      replacements.categoria_id = Number(categoria_id);
+    }
+
+    if (clase_id) {
+      whereConditions.push("p.clase_id = :clase_id");
+      replacements.clase_id = Number(clase_id);
+    }
+
+    if (tela_id) {
+      whereConditions.push("p.tela_id = :tela_id");
+      replacements.tela_id = Number(tela_id);
+    }
+
+    // accesorios
+    if (accesorio_id) {
+      whereConditions.push("p.accesorio_id = :accesorio_id");
+      replacements.accesorio_id = Number(accesorio_id);
+    }
+
+    if (accesorio_tipo_id) {
+      whereConditions.push("p.accesorio_tipo_id = :accesorio_tipo_id");
+      replacements.accesorio_tipo_id = Number(accesorio_tipo_id);
+    }
+
+    if (accesorio_material_id) {
+      whereConditions.push("p.accesorio_material_id = :accesorio_material_id");
+      replacements.accesorio_material_id = Number(accesorio_material_id);
+    }
+
+    // origen
+    if (departamento) {
+      whereConditions.push("p.departamento = :departamento");
+      replacements.departamento = departamento;
+    }
+
+    if (municipio) {
+      whereConditions.push("p.municipio = :municipio");
+      replacements.municipio = municipio;
+    }
+
+    // precio
+    if (precioMin !== undefined) {
+      whereConditions.push("p.precio >= :precioMin");
+      replacements.precioMin = Number(precioMin);
+    }
+    
+    if (precioMax !== undefined) {
+      whereConditions.push("p.precio <= :precioMax");
+      replacements.precioMax = Number(precioMax);
+    }    
+
+    // ⭐ Filtro por rating mínimo
+    if (ratingMin !== undefined) {
+      const ratingMinNumber = Number(ratingMin);
+
+      if (Number.isFinite(ratingMinNumber)) {
+        whereConditions.push("COALESCE(p.rating_avg, 0) >= :ratingMin");
+        replacements.ratingMin = ratingMinNumber;
+      }
+    }
+
+    const whereSQL = whereConditions.length
+      ? `WHERE ${whereConditions.join(" AND ")}`
+      : "";
+
+    // ============================
+    // 🔃 Ordenamiento inteligente
+    // ============================
+    let orderSQL = "ORDER BY p.created_at DESC";
+
+    // 🔎 Si hay búsqueda → ordenar por relevancia
+    if (search && String(search).trim() !== "") {
+      orderSQL = `
+        ORDER BY 
+        ts_rank(
+          p.search_vector,
+          plainto_tsquery('spanish', :search)
+        ) DESC,
+        p.created_at DESC
+      `;
+    }
+
+    // 💰 Orden explícito por precio (sobrescribe todo)
+    if (sort === "precio_asc") orderSQL = "ORDER BY p.precio ASC";
+    if (sort === "precio_desc") orderSQL = "ORDER BY p.precio DESC";
+
+    if (sort === "top_rated") {
+      orderSQL = `
+        ORDER BY 
+          (p.rating_avg * LN(1 + p.rating_count)) DESC,
+          p.rating_count DESC,
+          p.created_at DESC
+      `;
+    }        
+
+    const ratingMinNumber =
+      ratingMin !== undefined && ratingMin !== null
+        ? Number(ratingMin)
+        : null;    
+
+    // ============================
+    // 📊 Query principal
+    // ============================
+    const query = `
+      SELECT 
+        p.id,
+        p.nombre,
+        p.precio,
+        p.imagen_url,
+        p.departamento,
+        p.municipio,
+        p.rating_avg,
+        p.rating_count,
+        c.id AS categoria_id,
+        c.nombre AS categoria_nombre,
+        ${
+          search && String(search).trim() !== ""
+            ? "ts_rank(p.search_vector, plainto_tsquery('spanish', :search)) AS rank"
+            : "0 AS rank"
+        }
+      FROM productos p
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      LEFT JOIN categorias c ON c.id = p.categoria_id
+      ${whereSQL}
+      ${orderSQL}
+      LIMIT :limit
+      OFFSET :offset
+    `;
+
+    const rows: any = await sequelize.query(query, {
+      replacements,
+      type: QueryTypes.SELECT,
+    });
+
+    if (search && String(search).trim() !== "") {
+      await logEvent({
+        type: "search_query",
+        user_id: (req as any).user?.id || null,
+        metadata: { query: search },
+      });
+}
+
+    // ============================
+    // 📈 Total count
+    // ============================
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM productos p
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      ${whereSQL}
+    `;
+
+    const countResult: any = await sequelize.query(countQuery, {
+      replacements,
+      type: QueryTypes.SELECT,
+    });
+
+    const total = countResult[0]?.total || 0;
+
+    if (total === 0 && search) {
+      await logEvent({
+        type: "search_query",
+        user_id: (req as any).user?.id || null,
+        metadata: {
+          query: search,
+          no_results: true,
+        },
+      });
+    }
+
+    // ============================
+    // 🔁 Related si no hay resultados
+    // ============================
+    let related: any[] = [];
+
+    if (total === 0 && search) {
+      const relatedQuery = `
+        SELECT
+          p.id,
+          p.nombre,
+          p.precio,
+          p.imagen_url,
+          p.rating_avg,
+          p.rating_count,
+          p.departamento,
+          p.municipio,
+          c.id AS categoria_id,
+          c.nombre AS categoria_nombre
+        FROM productos p
+        JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+        LEFT JOIN categorias c ON c.id = p.categoria_id
+        WHERE p.activo = true
+        AND v.estado_validacion = 'aprobado'
+        AND v.estado_admin = 'activo'
+        AND (
+          p.nombre ILIKE :search
+          OR p.descripcion ILIKE :search
+          OR c.nombre ILIKE :search
+        )
+        ORDER BY p.created_at DESC
+        LIMIT 24
+      `;
+
+      related = await sequelize.query(relatedQuery, {
+        replacements: { search: `%${String(search).trim()}%` },
+        type: QueryTypes.SELECT,
+      });
+    }
+
+    const data = rows.map((r: any) =>
+      buildSearchProductDTO(r)
+    );
+
+    const relatedCards = related.map((r: any) =>
+      buildPublicProductCardDTO(r)
+    );
+
+    res.json({
+      success: true,
+      total,
+      page: pageNumber,
+      limit: limitNumber,
+      data,
+      related: relatedCards,
+    });
+
+  } catch (error) {
+    console.error("Error en getFilteredProducts:", error);
+    res.status(500).json({
+      message: "Error al obtener productos",
+    });
+  }
+};
+
+// ===========================
+// Filtros únicos (categoría_custom, tela_custom)
+// ===========================
+export const getFilters = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    // =====================================================
+    // 🔒 VALIDACIÓN ROBUSTA DEL PARAM
+    // =====================================================
+    const tipoParam = req.params.tipo;
+    const tipo = Array.isArray(tipoParam) ? tipoParam[0] : tipoParam;
+
+    if (!tipo || !["categories", "fabrics"].includes(tipo)) {
+      res.status(400).json({ message: "Tipo de filtro no válido" });
+      return;
+    }
+
+    // =====================================================
+    // 🧱 MAPEO CONTROLADO DE COLUMNAS (ANTI SQL INJECTION)
+    // =====================================================
+    const columnMap: Record<string, string> = {
+      categories: "categoria_custom",
+      fabrics: "tela_custom",
+    };
+
+    const columna = columnMap[tipo];
+
+    // =====================================================
+    // 🔎 QUERY
+    // =====================================================
+    const rows: any = await sequelize.query(
+      `
+      SELECT DISTINCT ${columna} AS nombre
+      FROM productos
+      WHERE ${columna} IS NOT NULL
+      ORDER BY nombre ASC
+      `,
+      {
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    // =====================================================
+    // 📦 RESPUESTA LIMPIA
+    // =====================================================
+    const data = (rows || [])
+      .map((r: any) => r.nombre)
+      .filter((v: string | null) => !!v);
+
+    res.json({ data });
+
+  } catch (error) {
+    console.error("Error getFilters:", error);
+    res.status(500).json({ message: "Error interno" });
+  }
+};
+
+export const getProductReviews = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const idParam = req.params.id;
+    const id = Array.isArray(idParam) ? idParam[0] : idParam;
+    const sortParam = Array.isArray(req.query.sort) ? req.query.sort[0] : req.query.sort;
+    const sort =
+      sortParam === "highest_rating" ||
+      sortParam === "lowest_rating" ||
+      sortParam === "most_helpful" ||
+      sortParam === "newest"
+        ? sortParam
+        : "newest";
+
+    if (!id) {
+      res.status(400).json({ message: "ID de producto requerido" });
+      return;
+    }
+
+    const { rating_count, rating_avg, breakdown, reviews } = await listProductReviews(id, sort);
+
+    res.json({
+      success: true,
+      total: rating_count,
+      rating_count,
+      rating_avg,
+      breakdown,
+      sort,
+      reviews,
+    });
+
+  } catch (error) {
+    console.error("Error getProductReviews:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener reseñas",
+    });
+  }
+};
+
+export const createProductReview = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    if (!req.user?.id) {
+      res.status(401).json({ message: "No autenticado" });
+      return;
+    }
+
+    const userId = Number(req.user.id);
+
+    if (req.user.role !== "buyer") {
+      res.status(403).json({ message: "Solo compradores pueden dejar reseñas" });
+      return;
+    }
+
+    // ── Product ID ──────────────────────────────────────────────────────────
+    const idParam = req.params.id;
+    const idRaw   = Array.isArray(idParam) ? idParam[0] : idParam;
+
+    if (!idRaw || !isUUID(idRaw)) {
+      res.status(400).json({ message: "ID de producto inválido" });
+      return;
+    }
+
+    const productId = idRaw;
+
+    // ── Rating ──────────────────────────────────────────────────────────────
+    const ratingNumber = Number(req.body.rating);
+
+    if (!Number.isInteger(ratingNumber) || ratingNumber < 1 || ratingNumber > 5) {
+      res.status(400).json({ message: "Rating debe ser un número entero entre 1 y 5" });
+      return;
+    }
+    const created = await createReviewFromPurchase({
+      buyerId:    userId,
+      productId,
+      rating:     ratingNumber,
+      comentario: req.body.comentario ?? req.body.comment ?? null,
+    });
+
+    // ── Analytics (non-blocking) ─────────────────────────────────────────────
+    logEvent({ type: "review_created", user_id: userId, product_id: productId }).catch(() => {});
+
+    // ── Review notifications (non-blocking) ──────────────────────────────────
+    if (created.seller_id) {
+      emitAppEvent("review.created", {
+        buyerId:   userId,
+        sellerId:  Number(created.seller_id),
+        productId,
+        rating:    ratingNumber,
+      });
+    }
+
+    res.status(201).json({
+      success:      true,
+      message:      "Reseña creada correctamente",
+      rating_avg:   created.rating_avg,
+      rating_count: created.rating_count,
+      review_id:    created.review_id,
+    });
+
+  } catch (error: any) {
+    if (error?.message === "PRODUCT_NOT_REVIEWABLE") {
+      res.status(404).json({ message: "Producto no disponible para reseñas" });
+      return;
+    }
+    if (error?.message === "ALREADY_REVIEWED") {
+      res.status(409).json({ message: "Ya has dejado una reseña para este producto" });
+      return;
+    }
+    if (error?.message === "PURCHASE_REQUIRED") {
+      res.status(403).json({
+        message: "Solo puedes reseñar productos que hayas comprado y recibido",
+        code:    "PURCHASE_REQUIRED",
+      });
+      return;
+    }
+    console.error("❌ Error createProductReview:", error);
+    res.status(500).json({ success: false, message: "Error al crear reseña" });
+  }
+};
+
+export const getHomeCatalog = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const seedParam = Array.isArray(req.query.seed) ? req.query.seed[0] : req.query.seed;
+    const limitParam = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+    const categoryParam = Array.isArray(req.query.featuredCategoryId)
+      ? req.query.featuredCategoryId[0]
+      : req.query.featuredCategoryId;
+
+    const featuredCategoryId = toIntOrNull(categoryParam);
+    const sectionSize = toIntOrNull(limitParam) ?? undefined;
+
+    const result = await buildHomeCatalog({
+      options: {
+        seed: typeof seedParam === "string" ? seedParam : undefined,
+        featuredCategoryId,
+        sectionSize,
+      },
+      mapProduct: buildPublicProductCardDTO,
+    });
+
+    console.log({
+      featured: result.sections.featured.items.map((p: any) => p.id),
+      newArrivals: result.sections.new_arrivals.items.map((p: any) => p.id),
+      trending: result.sections.trending.items.map((p: any) => p.id),
+    });
+
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error("[getHomeCatalog] ERROR:", (error as any)?.message);
+    console.error("[getHomeCatalog] SQL:", (error as any)?.parent?.message);
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener catálogo de inicio",
+    });
+  }
+};
+
+export const getTopProductsByCategory = async (
+  req: Request,
+  res: Response
+) => {
+  try {
+    const categoriaId = Number(req.params.categoriaId);
+
+    if (!categoriaId) {
+      return res.status(400).json({ message: "Categoría inválida" });
+    }
+
+    const products = await sequelize.query(
+      `
+      SELECT
+        p.id,
+        p.nombre,
+        p.precio,
+        p.imagen_url,
+        COUNT(r.id) AS total_reviews,
+        COALESCE(ROUND(AVG(r.rating)::numeric, 2), 0) AS rating_avg,
+        (
+          (COUNT(r.id)::float / (COUNT(r.id) + 5)) * COALESCE(AVG(r.rating), 0)
+          +
+          (5.0 / (COUNT(r.id) + 5)) * 3.5
+        ) AS weighted_score
+      FROM productos p
+      JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+      LEFT JOIN reviews r ON r.producto_id = p.id
+      WHERE p.activo = true
+      AND p.categoria_id = :categoriaId
+      AND v.estado_validacion = 'aprobado'
+      AND v.estado_admin = 'activo'
+      GROUP BY p.id
+      ORDER BY weighted_score DESC NULLS LAST
+      LIMIT 8
+      `,
+      {
+        replacements: { categoriaId },
+        type: QueryTypes.SELECT,
+      }
+    );    
+
+    const normalized = (products as any[]).map((p) => ({
+      id: p.id,
+      nombre: p.nombre,
+      precio: Number(p.precio),
+      imagen_url: buildMediaProxyUrl(p.imagen_url),
+      total_reviews: Number(p.total_reviews),
+      rating_avg: Number(Number(p.rating_avg).toFixed(2)),
+      weighted_score: Number(Number(p.weighted_score).toFixed(3)),
+    }));
+
+    res.json({
+      success: true,
+      data: normalized,
+    });
+  } catch (error) {
+    console.error("Error obteniendo top productos por categoría:", error);
+    res.status(500).json({ message: "Error interno" });
+  }
+};
+
+export const getTrendingProducts = async (req: Request, res: Response) => {
+  try {
+    const products = await sequelize.query(
+      `
+      SELECT *
+      FROM (
+        SELECT
+          p.id,
+          p.nombre,
+          p.precio,
+          p.created_at,
+          COALESCE(
+          (
+            SELECT pi.url
+            FROM producto_imagenes pi
+            WHERE pi.producto_id = p.id
+            ORDER BY pi.created_at ASC
+            LIMIT 1
+          ),
+          p.imagen_url
+        ) AS imagen_url,
+          COUNT(r.id) AS total_reviews,
+          COALESCE(ROUND(AVG(r.rating)::numeric, 2), 0) AS rating_avg,
+          (
+            (
+              (
+                (COUNT(r.id)::float / (COUNT(r.id) + 5)) * COALESCE(AVG(r.rating), 0)
+                +
+                (5.0 / (COUNT(r.id) + 5)) * 3.5
+              ) * 0.7
+              +
+              (
+                GREATEST(0, 1 - EXTRACT(EPOCH FROM (NOW() - p.created_at)) / 864000)
+              ) * 0.3
+            )
+            *
+            (
+              CASE 
+                WHEN EXISTS (
+                  SELECT 1 
+                  FROM producto_imagenes pi2
+                  WHERE pi2.producto_id = p.id
+                )
+                THEN 1
+                ELSE 0.85
+              END
+            )
+          ) AS trending_score
+        FROM productos p
+        JOIN vendedor_perfil v ON v.user_id = p.vendedor_id
+        LEFT JOIN reviews r ON r.producto_id = p.id
+        WHERE p.activo = true
+        AND v.estado_validacion = 'aprobado'
+        AND v.estado_admin = 'activo'
+        GROUP BY p.id
+      ) sub
+      ORDER BY
+        sub.trending_score DESC,
+        sub.total_reviews DESC,
+        sub.created_at DESC
+      LIMIT 8
+      `,
+      { type: QueryTypes.SELECT }
+    );
+
+    const normalized = (products as any[]).map((p: any) => ({
+      id: p.id,
+      nombre: p.nombre,
+      precio: Number(p.precio),
+      imagen_url: buildMediaProxyUrl(p.imagen_url),
+      total_reviews: Number(p.total_reviews),
+      rating_avg: Number(p.rating_avg),
+      trending_score: Number(p.trending_score),
+    }));
+
+    res.json({
+      success: true,
+      data: normalized,
+    });
+
+  } catch (error) {
+    console.error("[getTrendingProducts] ERROR:", (error as any)?.message);
+    console.error("[getTrendingProducts] SQL:", (error as any)?.parent?.message);
+    res.json({ success: true, data: [] });
+  }
+};
