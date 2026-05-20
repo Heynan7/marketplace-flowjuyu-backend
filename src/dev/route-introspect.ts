@@ -3,7 +3,7 @@
 import type { Express } from "express";
 
 // El paquete no trae tipos oficiales; usamos require para evitar errores de TS
-// eslint-disable-next-line @typescript-eslint/no-var-requires
+ 
 const listEndpoints: (
   app: Express,
 ) => Array<{ path: string; methods: string[]; middlewares?: string[] }> =

@@ -6,7 +6,6 @@ import { QueryTypes } from "sequelize";
 import { User } from "../models/user.model";
 import { sequelize } from "../config/db";
 import supabase from "../lib/supabase";
-import Product from "../models/product.model";
 import { getSellerAnalyticsData } from "../services/analytics.service";
 import { v4 as uuidv4 } from "uuid";
 import { verifyRefreshToken } from "../lib/jwt";

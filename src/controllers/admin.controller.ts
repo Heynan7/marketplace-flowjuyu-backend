@@ -2,7 +2,6 @@ import { Request, Response, RequestHandler } from "express";
 import { QueryTypes } from "sequelize";
 import { sequelize } from "../config/db";
 import { User } from "../models/user.model";
-import Product from "../models/product.model";
 import { VendedorPerfil } from "../models/VendedorPerfil";
 import { Ticket } from "../models/ticket.model";
 import { TicketMessage } from "../models/ticketMessage.model";

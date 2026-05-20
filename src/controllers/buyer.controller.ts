@@ -1,7 +1,5 @@
 // src/controllers/buyer.controller.ts
 import { Request, Response } from "express";
-import { QueryTypes } from "sequelize";
-import { sequelize } from "../config/db";
 import Address from "../models/Address.model";
 import { listBuyerPendingReviews, listBuyerReviews } from "../services/review.service";
 

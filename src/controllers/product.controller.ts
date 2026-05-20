@@ -3,8 +3,6 @@ import { Request, Response } from "express";
 import { sequelize } from "../config/db";
 import multer from "multer";
 import supabase from "../lib/supabase";
-import Product from "../models/product.model";
-import { Op } from "sequelize";
 import { validate as isUUID } from "uuid";
 import { QueryTypes } from "sequelize";
 import { buildPublicProductDTO } from "../utils/buildPublicProductDTO";

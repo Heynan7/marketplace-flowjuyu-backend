@@ -712,7 +712,7 @@ export const getGeneration: RequestHandler = async (req, res) => {
           replacements.actualCost = jobStatus.actualCostCents ?? 0;
 
           let finalOutputUrl = jobStatus.outputUrl ?? null;
-          let finalPreviewUrl = jobStatus.previewUrl ?? null;
+          const finalPreviewUrl = jobStatus.previewUrl ?? null;
 
           // ── Storage pipeline: download → Supabase ─────────────────────────
           if (jobStatus.outputUrl) {
